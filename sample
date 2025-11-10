@@ -1,0 +1,78 @@
+public sealed class RemapOrchestrator : IRemapOrchestrator
+{
+    private readonly IRemapRepository _repo;
+    private readonly IRemapTransformer _transformer;
+    private readonly IOptions<RemapOptions> _opts;
+    private readonly ILogger<RemapOrchestrator> _log;
+
+    public RemapOrchestrator(
+        IRemapRepository repo,
+        IRemapTransformer transformer,
+        IOptions<RemapOptions> opts,
+        ILogger<RemapOrchestrator> log)
+    {
+        _repo = repo;
+        _transformer = transformer;
+        _opts = opts;
+        _log = log;
+    }
+
+    public async Task RunOneGlobalCycleAsync(CancellationToken ct)
+    {
+        var batchSize = _opts.Value.BatchSize;
+        var parallelism = Math.Max(1, _opts.Value.Parallelism);
+
+        // 1) Claim a mixed batch across remaps (SP handles site logic — no input needed)
+        var claimed = await _repo.ClaimNextBatchGlobalAsync(batchSize, ct);
+        if (claimed.Count == 0)
+        {
+            _log.LogInformation("No work claimed.");
+            return;
+        }
+
+        // 2) Group by RemapID
+        var groups = claimed
+            .GroupBy(x => x.RemapId)
+            .Select(g => new { RemapId = g.Key, DocKeys = g.Select(d => d.DocumentKey).ToList() })
+            .ToList();
+
+        // 3) Process each remap group concurrently (based on Parallelism)
+        await Parallel.ForEachAsync(groups,
+            new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct },
+            async (grp, token) =>
+            {
+                try
+                {
+                    // Load config once per remap group
+                    var job = await _repo.GetJobAsync(grp.RemapId, token);
+                    var rules = await _repo.LoadRulesAsync(grp.RemapId, token);
+                    var docs = await _repo.GetDocumentsAsync(grp.DocKeys, token);
+
+                    var results = new List<TransformedDoc>(docs.Count);
+
+                    foreach (var d in docs)
+                    {
+                        try
+                        {
+                            var transformed = _transformer.Transform(job!, rules, d);
+                            results.Add(transformed);
+                        }
+                        catch (Exception ex)
+                        {
+                            _log.LogError(ex, "Transform failed for {DocKey} (Remap {RemapId})", d.DocumentKey, grp.RemapId);
+                            results.Add(new TransformedDoc(d.DocumentKey, d.Xml, null, "ERROR"));
+                        }
+                    }
+
+                    // Apply once per remap group
+                    await _repo.ApplyBatchAsync(grp.RemapId, results, token);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "Failed processing Remap {RemapId}", grp.RemapId);
+                }
+            });
+
+        _log.LogInformation("Cycle completed.");
+    }
+}
