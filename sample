@@ -1,8 +1,203 @@
+Great—here’s exactly how to do the **“once per parallel shard”** approach, with **no per-RemapID grouping**. We’ll:
+
+* claim **one global batch** (mixed RemapIDs),
+* pre-load **jobs + rules** for all RemapIDs in that batch,
+* split the batch into **P shards** where `P = Parallelism`,
+* **process each shard in parallel** and call **ApplyBatchAsync once per shard** (so for BatchSize=1000 and Parallelism=4 → **4 DB calls**),
+* **no SiteCode param** anywhere in this method (per your instruction).
+
+I’m showing only the changed/added parts (Core + Infra contracts unchanged elsewhere).
+
+---
+
+## 1) Core models – add RemapId to the work + result
+
+```csharp
+// Remap.Core.Models
+public sealed record ClaimedWorkItem(Guid DocumentKey, int RemapId);
+public sealed record DocumentRecord(Guid DocumentKey, string Xml, string? DocDesc);
+public sealed record TransformedDoc(Guid DocumentKey, int RemapId, string NewXml, string? AppendNote, string Status);
+```
+
+---
+
+## 2) Repository contract for global batch (no SiteCode param)
+
+```csharp
+// Remap.Core.Abstractions
 public interface IRemapRepository
 {
-    Task<IReadOnlyList<ClaimedWork>> ClaimNextBatchGlobalAsync(int batchSize, CancellationToken ct);
-    Task<RemapJob?> GetJobAsync(int remapId, CancellationToken ct);
-    Task<IReadOnlyList<FieldRule>> LoadRulesAsync(int remapId, CancellationToken ct);
+    // GLOBAL claim: returns a mixed list across remaps
+    Task<IReadOnlyList<ClaimedWorkItem>> ClaimNextGlobalBatchAsync(int batchSize, CancellationToken ct);
+
+    // Load jobs/rules for a set of remapIds (1 call each, cached in memory for the cycle)
+    Task<IDictionary<int, RemapJob>> GetJobsAsync(IEnumerable<int> remapIds, CancellationToken ct);
+    Task<IDictionary<int, IReadOnlyList<FieldRule>>> GetRulesAsync(IEnumerable<int> remapIds, CancellationToken ct);
+
     Task<IReadOnlyList<DocumentRecord>> GetDocumentsAsync(IEnumerable<Guid> docKeys, CancellationToken ct);
-    Task ApplyBatchAsync(int remapId, IEnumerable<TransformedDoc> results, CancellationToken ct);
+
+    // Apply once per shard (TVP includes RemapId per row; your SP already supports this)
+    Task ApplyBatchAsync(IEnumerable<TransformedDoc> results, CancellationToken ct);
 }
+```
+
+> ^ This assumes your **ApplyBatch** SP now takes a TVP where each row carries its **RemapId** (you told me earlier you modified the SP to work across remaps—good).
+
+---
+
+## 3) Orchestrator — **RunOneGlobalCycleAsync** with shard fan-out
+
+```csharp
+// Remap.Core.Services.RemapOrchestrator
+using System.Collections.Concurrent;
+using Remap.Core.Abstractions;
+using Remap.Core.Models;
+using Microsoft.Extensions.Logging;
+
+public sealed class RemapOrchestrator : IRemapOrchestrator
+{
+    private readonly IRemapRepository _repo;
+    private readonly IRemapTransformer _transformer;
+    private readonly ILogger<RemapOrchestrator> _log;
+    private readonly int _parallelism;
+
+    public RemapOrchestrator(IRemapRepository repo,
+                             IRemapTransformer transformer,
+                             ILogger<RemapOrchestrator> log,
+                             int parallelism = 4) // you can bind from config elsewhere
+    {
+        _repo = repo;
+        _transformer = transformer;
+        _log = log;
+        _parallelism = Math.Max(1, parallelism);
+    }
+
+    public async Task RunOneGlobalCycleAsync(int batchSize, CancellationToken ct)
+    {
+        // 1) Claim one global batch across remaps
+        var items = await _repo.ClaimNextGlobalBatchAsync(batchSize, ct);
+        if (items.Count == 0) { _log.LogInformation("No work claimed."); return; }
+
+        _log.LogInformation("Claimed {Count} docs across remaps.", items.Count);
+
+        // 2) Preload jobs + rules for all distinct remaps in this batch
+        var remapIds = items.Select(i => i.RemapId).Distinct().ToArray();
+
+        var jobsTask  = _repo.GetJobsAsync(remapIds, ct);
+        var rulesTask = _repo.GetRulesAsync(remapIds, ct);
+        await Task.WhenAll(jobsTask, rulesTask);
+
+        var jobs  = jobsTask.Result;   // IDictionary<int, RemapJob>
+        var rules = rulesTask.Result;  // IDictionary<int, IReadOnlyList<FieldRule>>
+
+        // 3) Fetch documents for claimed keys (single read)
+        var docKeys = items.Select(i => i.DocumentKey).Distinct().ToArray();
+        var docs = await _repo.GetDocumentsAsync(docKeys, ct);
+        var docMap = docs.ToDictionary(d => d.DocumentKey);
+
+        // 4) Partition into P shards (BatchSize/Parallelism each, last shard may be smaller)
+        var shards = MakeShards(items, _parallelism);
+
+        // 5) Process shards in parallel; each shard does ONE ApplyBatchAsync
+        var parallelOpts = new ParallelOptions { MaxDegreeOfParallelism = _parallelism, CancellationToken = ct };
+        await Task.Run(() =>
+        {
+            Parallel.ForEach(shards, parallelOpts, shard =>
+            {
+                var local = new List<TransformedDoc>(shard.Count);
+
+                foreach (var wi in shard)
+                {
+                    if (!docMap.TryGetValue(wi.DocumentKey, out var doc))
+                    {
+                        // Missing doc row—mark error
+                        local.Add(new TransformedDoc(wi.DocumentKey, wi.RemapId, "<FieldData />", null, "ERROR"));
+                        continue;
+                    }
+
+                    if (!jobs.TryGetValue(wi.RemapId, out var job))
+                    {
+                        local.Add(new TransformedDoc(wi.DocumentKey, wi.RemapId, doc.Xml, null, "ERROR"));
+                        continue;
+                    }
+                    if (!rules.TryGetValue(wi.RemapId, out var rset) || rset.Count == 0)
+                    {
+                        local.Add(new TransformedDoc(wi.DocumentKey, wi.RemapId, doc.Xml, null, "ERROR"));
+                        continue;
+                    }
+
+                    try
+                    {
+                        var td = _transformer.Transform(job, rset, doc);
+                        // ensure result carries remapId
+                        local.Add(td with { RemapId = wi.RemapId });
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "Transform failed for {DocKey}", wi.DocumentKey);
+                        local.Add(new TransformedDoc(wi.DocumentKey, wi.RemapId, doc.Xml, null, "ERROR"));
+                    }
+                }
+
+                // ONE DB call per shard
+                _repo.ApplyBatchAsync(local, ct).GetAwaiter().GetResult();
+            });
+        }, ct);
+
+        _log.LogInformation("Processed {Count} docs in {Shards} shards.", items.Count, shards.Count);
+    }
+
+    // Helper: even chunking by count, not by RemapId
+    private static List<List<ClaimedWorkItem>> MakeShards(IReadOnlyList<ClaimedWorkItem> items, int parallelism)
+    {
+        if (parallelism <= 1 || items.Count <= 1)
+            return new List<List<ClaimedWorkItem>> { items.ToList() };
+
+        int shardSize = Math.Max(1, (int)Math.Ceiling(items.Count / (double)parallelism));
+        var shards = new List<List<ClaimedWorkItem>>(parallelism);
+        for (int i = 0; i < items.Count; i += shardSize)
+        {
+            var slice = items.Skip(i).Take(shardSize).ToList();
+            if (slice.Count > 0) shards.Add(slice);
+        }
+        return shards;
+    }
+}
+```
+
+**What this achieves**
+
+* **Exactly 4 calls** to `ApplyBatchAsync` for a 1000-item batch with Parallelism=4.
+* **No SiteCode param** here; SiteCode is enforced in your SPs (as you wanted).
+* **No RemapID grouping** for DB calls—the TVP rows carry their own `RemapId`.
+
+---
+
+## 4) Transformer contract/result (unchanged except it must return RemapId in result)
+
+```csharp
+// Remap.Core.Abstractions
+public interface IRemapTransformer
+{
+    // Must return TransformedDoc that includes RemapId (the orchestrator fills it if needed)
+    TransformedDoc Transform(RemapJob job, IReadOnlyList<FieldRule> rules, DocumentRecord doc);
+}
+```
+
+---
+
+## 5) Repository ApplyBatchAsync TVP (across remaps)
+
+Your **infrastructure** method should fill a TVP with **DocumentKey, RemapId, NewXml, AppendNote, Status** and call the **single** SP that updates XML + DocDesc + migration log **across remaps** in one go (per shard). Since you asked not to change SPs now, I’m assuming you already have the version that accepts **RemapId per TVP row**.
+
+---
+
+### Summary
+
+* This design **processes a mixed batch** returned by your global claim SP.
+* It **splits by count** into `Parallelism` shards, not by RemapId.
+* It performs **one DB apply per shard** → predictable DB load: **BatchSize / Parallelism** calls.
+* It **doesn’t accept SiteCode** in the orchestrator method (as requested).
+* It scales to **multiple Function instances** safely as long as the **claim SP** atomically seeds/locks work (which you already designed).
+
+If you want, I can also show a quick **repo implementation stub** for `ClaimNextGlobalBatchAsync` and `ApplyBatchAsync` TVP shape to match this orchestrator.
