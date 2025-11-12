@@ -1,508 +1,182 @@
-Awesome—congrats on getting the solution building. Here’s a practical, copy-pasteable **testing plan + code** for your `Remap.Tests` project that covers:
+Here are 2–3 sharp, valuable inputs you can bring to your discovery session on invoice ingestion that will make you sound thoughtful and strategic — even if you're not leading the effort.
 
-* fast **unit tests** (Transformer + Orchestrator parallelism),
-* realistic **integration tests** against a real SQL Server using **Testcontainers** (schema + TVPs/SPs + seed + end-to-end run),
-* plus a few utilities (fixtures, seeding, and DB reset).
-
-I’ll keep it tight but complete.
 
 ---
 
-# 0) Test project setup
+🧠 1. Push for Modular Black Box Design
 
-## `Remap.Tests.csproj` (packages)
+> "Can we design the black box so that it supports not just invoices, but other document types in the future — like receipts or purchase orders — with minimal changes?"
 
-```xml
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <IsPackable>false</IsPackable>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="xunit" Version="2.9.0" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
-    <PackageReference Include="FluentAssertions" Version="6.12.0" />
-    <PackageReference Include="Moq" Version="4.20.70" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
 
-    <!-- Integration testing -->
-    <PackageReference Include="Testcontainers" Version="3.8.0" />
-    <PackageReference Include="Testcontainers.MsSql" Version="3.8.0" />
-    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.0" />
-    <PackageReference Include="Dapper" Version="2.1.35" />
-  </ItemGroup>
-  <ItemGroup>
-    <!-- reference your prod projects -->
-    <ProjectReference Include="..\Remap.Core\Remap.Core.csproj" />
-    <ProjectReference Include="..\Remap.Infrastructure\Remap.Infrastructure.csproj" />
-  </ItemGroup>
-</Project>
-```
+
+Why this helps:
+
+Makes the system more future-proof and reusable
+
+Encourages building with pluggable document type handlers (invoice, receipt, etc.)
+
+
 
 ---
 
-# 1) Unit tests
+🧱 2. Validate Edge Cases for Document Quality
 
-## A) `PositionalXmlTransformerTests.cs`
+> "Should we plan for quality issues like blurry scans, handwritten notes, or multiple invoices in a single file?"
 
-Covers MAP / DISCARD / APPEND (to DocDesc), NEW/empty nodes, and positional order.
 
-```csharp
-using FluentAssertions;
-using Remap.Core.Models;
-using Remap.Core.Services;
-using Xunit;
 
-public class PositionalXmlTransformerTests
-{
-    private readonly PositionalXmlTransformer _sut = new();
+Why this helps:
 
-    [Fact]
-    public void Map_Discard_Append_New_Produces_Positional_Target()
-    {
-        // source: <Field1>A</Field1><Field2>B</Field2><Field3>C</Field3>
-        var src = "<FieldData><Field1>A</Field1><Field2>B</Field2><Field3>C</Field3></FieldData>";
-        var doc = new DocumentRecord(Guid.NewGuid(), src, null);
+Surfaces real-world input problems early
 
-        var job = new RemapJob(remapId: 42, SourceCategoryKey: Guid.NewGuid(),
-                               TargetCategoryKey: Guid.NewGuid(), AppendUnmapped: true);
+Opens up discussion around pre-processing with AI Vision OCR, image enhancement, or manual review fallback
 
-        var rules = new[]
-        {
-            new FieldRule(TargetFieldNumber: 1, Action: "MAP",     SourceFieldNumber: 2, DefaultValue: null), // B
-            new FieldRule(TargetFieldNumber: 2, Action: "DISCARD", SourceFieldNumber: null, DefaultValue: null), // empty
-            new FieldRule(TargetFieldNumber: 3, Action: "APPEND",  SourceFieldNumber: 1, DefaultValue: "X"), // append "A", xml "X"
-            new FieldRule(TargetFieldNumber: 4, Action: "MAP",     SourceFieldNumber: 99, DefaultValue: "DEF"), // source missing -> DEF
-        };
 
-        var res = _sut.Transform(job, rules, doc);
-
-        res.Status.Should().Be("COMPLETED");
-        res.AppendNote.Should().Be("A"); // appended from Field1
-        res.NewXml.Should().Be("<FieldData><Field1>B</Field1><Field2></Field2><Field3>X</Field3><Field4>DEF</Field4></FieldData>");
-    }
-
-    [Fact]
-    public void Missing_Source_Gives_Empty_Node_When_No_Default()
-    {
-        var src = "<FieldData><Field1>A</Field1></FieldData>";
-        var doc = new DocumentRecord(Guid.NewGuid(), src, null);
-        var job = new RemapJob(1, Guid.NewGuid(), Guid.NewGuid(), AppendUnmapped: false);
-        var rules = new[] { new FieldRule(1, "MAP", 3, null) }; // source 3 missing
-
-        var res = _sut.Transform(job, rules, doc);
-
-        res.NewXml.Should().Be("<FieldData><Field1></Field1></FieldData>");
-        res.AppendNote.Should().BeNull();
-    }
-
-    [Fact]
-    public void Append_Ignored_When_AppendUnmapped_False()
-    {
-        var src = "<FieldData><Field1>A</Field1></FieldData>";
-        var doc = new DocumentRecord(Guid.NewGuid(), src, null);
-        var job = new RemapJob(1, Guid.NewGuid(), Guid.NewGuid(), AppendUnmapped: false);
-        var rules = new[] { new FieldRule(1, "APPEND", 1, "") };
-
-        var res = _sut.Transform(job, rules, doc);
-        res.AppendNote.Should().BeNull();
-        res.NewXml.Should().Be("<FieldData><Field1></Field1></FieldData>");
-    }
-}
-```
-
-## B) Orchestrator parallelism (no DB)
-
-Fakes the repository to verify **shard splitting** (`BatchSize / Parallelism`) and that `ApplyBatchAsync` is called **once per shard**.
-
-```csharp
-using FluentAssertions;
-using Moq;
-using Remap.Core.Abstractions;
-using Remap.Core.Models;
-using Remap.Core.Services;
-using Microsoft.Extensions.Logging.Abstractions;
-using Xunit;
-
-public class OrchestratorParallelismTests
-{
-    [Fact]
-    public async Task Splits_Work_Into_Equal_Shards_And_Applies_Per_Shard()
-    {
-        const int batchSize = 1000;
-        const int parallelism = 4;
-
-        // Arrange fake repo
-        var repo = new Mock<IRemapRepository>(MockBehavior.Strict);
-        var transformer = new Mock<IRemapTransformer>(MockBehavior.Strict);
-
-        // Claim returns mixed docs (simulate many remapIds globally)
-        var keys = Enumerable.Range(1, batchSize).Select(_ => Guid.NewGuid()).ToList();
-        repo.Setup(r => r.ClaimNextGlobalBatchAsync(batchSize, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(keys);
-
-        // GetDocuments returns one DocumentRecord per key
-        repo.Setup(r => r.GetDocumentsAsync(It.IsAny<IEnumerable<Guid>>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((IEnumerable<Guid> ids, CancellationToken _) =>
-                ids.Select(k => new DocumentRecord(k, "<FieldData><Field1>A</Field1></FieldData>", null)).ToList());
-
-        // Transformer returns a completed doc
-        transformer.Setup(t => t.Transform(It.IsAny<RemapJob>(), It.IsAny<IEnumerable<FieldRule>>(), It.IsAny<DocumentRecord>()))
-            .Returns<DocumentRecord>(d => new TransformedDoc(d.DocumentKey, "<FieldData><Field1>A</Field1></FieldData>", null, "COMPLETED"));
-
-        // For global cycle, assume rules/job are per-doc looked up internally
-        repo.Setup(r => r.ResolveJobForDocumentAsync(It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new RemapJob(99, Guid.NewGuid(), Guid.NewGuid(), true));
-        repo.Setup(r => r.LoadRulesAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new List<FieldRule> { new(1, "MAP", 1, null) });
-
-        // Track how many ApplyBatchAsync calls and sizes
-        var applyCalls = new List<int>();
-        repo.Setup(r => r.ApplyBatchAsync(It.IsAny<int>(), It.IsAny<IEnumerable<TransformedDoc>>(), It.IsAny<CancellationToken>()))
-            .Returns((int remapId, IEnumerable<TransformedDoc> items, CancellationToken _) =>
-            { applyCalls.Add(items.Count()); return Task.CompletedTask; });
-
-        var sut = new GlobalCycleOrchestrator(repo.Object, transformer.Object, NullLogger<GlobalCycleOrchestrator>.Instance);
-
-        // Act
-        await sut.RunOneGlobalCycleAsync(batchSize, parallelism, default);
-
-        // Assert
-        applyCalls.Count.Should().Be(parallelism);   // once per shard
-        applyCalls.Should().OnlyContain(c => c == batchSize / parallelism); // 250 each
-    }
-}
-```
-
-> Note: `GlobalCycleOrchestrator` here is your class that implements `RunOneGlobalCycleAsync(batchSize, parallelism, ct)` and uses:
->
-> * `ClaimNextGlobalBatchAsync(int batchSize, ct)` (no SiteCode param per your latest decision),
-> * shards = `batchSize / parallelism`,
-> * fetch docs per shard, transform, **ApplyBatchAsync once per shard**.
 
 ---
 
-# 2) Integration tests (real SQL in a container)
+🖥️ 3. Suggest Smart UI Features
 
-We’ll:
+> "In the UI, should we show confidence scores for extracted fields so users can easily review and correct low-confidence data?"
 
-* boot a disposable SQL Server via Testcontainers,
-* create **minimal** schema (tables + TVPs + procs),
-* seed a tiny dataset (1 remap, few rules, few docs),
-* run the **real** repository + transformer + orchestrator,
-* assert that:
 
-  * `tbl_IMG_DocumentData.FieldData` is rewritten,
-  * `tbl_IMG_DocumentKeys.DocDesc` appended,
-  * migration logs written and statuses updated.
 
-## A) `MsSqlFixture.cs`
+Why this helps:
 
-```csharp
-using DotNet.Testcontainers.Builders;
-using DotNet.Testcontainers.Containers;
-using Microsoft.Data.SqlClient;
-using Xunit;
+Improves trust in the AI extraction
 
-public sealed class MsSqlFixture : IAsyncLifetime
-{
-    private readonly MsSqlContainer _container =
-        new MsSqlBuilder().WithPassword("yourStrong(!)Password").Build();
+Allows for human-in-the-loop validation
 
-    public string ConnectionString => _container.GetConnectionString();
+Makes the system more robust and user-friendly
 
-    public async Task InitializeAsync()
-    {
-        await _container.StartAsync();
 
-        // Apply schema (tables + TVPs + procs) – keep fast and minimal for tests
-        await using var con = new SqlConnection(ConnectionString);
-        await con.OpenAsync();
-
-        var ddl = TestSchema.All;  // see next snippet
-        await using var cmd = new SqlCommand(ddl, con);
-        await cmd.ExecuteNonQueryAsync();
-    }
-
-    public async Task DisposeAsync() => await _container.DisposeAsync();
-}
-```
-
-## B) `TestSchema.cs` (minimal schema for tests)
-
-> Keep only the columns you truly use in tests.
-
-```csharp
-public static class TestSchema
-{
-  public const string All = @"
-  -- tables
-  CREATE TABLE dbo.tbl_IMG_DocumentCategoryRemap
-  ( RemapID INT IDENTITY PRIMARY KEY,
-    SourceCategoryKey UNIQUEIDENTIFIER NOT NULL,
-    TargetCategoryKey UNIQUEIDENTIFIER NOT NULL,
-    AppendUnmappedCategories BIT NOT NULL DEFAULT(1),
-    Status VARCHAR(20) NOT NULL DEFAULT('READY'),
-    TotalDocuments INT NOT NULL DEFAULT(0),
-    ProcessedDocuments INT NOT NULL DEFAULT(0),
-    ErroredDocuments INT NOT NULL DEFAULT(0),
-    ModifiedOn DATETIME2 NULL
-  );
-
-  CREATE TABLE dbo.tbl_IMG_DocumentCategoryRemapField
-  ( RemapFieldID INT IDENTITY PRIMARY KEY,
-    RemapID INT NOT NULL,
-    TargetFieldNumber INT NOT NULL,
-    Action VARCHAR(10) NOT NULL,
-    SourceFieldNumber INT NULL,
-    DefaultValue NVARCHAR(500) NULL
-  );
-
-  CREATE TABLE dbo.tbl_IMG_DocumentKeys
-  ( DocumentKey UNIQUEIDENTIFIER PRIMARY KEY,
-    CategoryKey UNIQUEIDENTIFIER NOT NULL,
-    DocDesc NVARCHAR(1000) NULL
-  );
-
-  CREATE TABLE dbo.tbl_IMG_DocumentData
-  ( DocumentKey UNIQUEIDENTIFIER PRIMARY KEY,
-    FieldData XML NOT NULL
-  );
-
-  CREATE TABLE dbo.tbl_IMG_DocumentCategoryRemapMigrationLog
-  ( RemapMigrationLogID INT IDENTITY PRIMARY KEY,
-    RemapID INT NOT NULL,
-    DocumentKey UNIQUEIDENTIFIER NOT NULL,
-    FieldDataBeforeMigration XML NULL,
-    Status VARCHAR(20) NOT NULL,
-    ModifiedBy NVARCHAR(128) NULL,
-    ModifiedOn DATETIME2 NULL
-  );
-
-  -- TVPs
-  CREATE TYPE dbo.TVP_DocumentBatch AS TABLE ( DocumentKey UNIQUEIDENTIFIER PRIMARY KEY );
-  CREATE TYPE dbo.TVP_TransformedDocs AS TABLE
-  ( DocumentKey UNIQUEIDENTIFIER PRIMARY KEY,
-    NewFieldData XML NOT NULL,
-    AppendNote NVARCHAR(500) NULL,
-    Status VARCHAR(12) NOT NULL );
-
-  -- Procs (subset required for a simple end-to-end)
-  CREATE OR ALTER PROC dbo.usp_Remap_ClaimNextBatch
-    @RemapID INT, @BatchSize INT
-  AS
-  BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @Docs TABLE (DocumentKey UNIQUEIDENTIFIER PRIMARY KEY);
-
-    INSERT @Docs(DocumentKey)
-    SELECT TOP (@BatchSize) dk.DocumentKey
-    FROM dbo.tbl_IMG_DocumentCategoryRemap r
-    JOIN dbo.tbl_IMG_DocumentKeys dk ON dk.CategoryKey = r.SourceCategoryKey
-    WHERE r.RemapID = @RemapID
-      AND NOT EXISTS (
-        SELECT 1 FROM dbo.tbl_IMG_DocumentCategoryRemapMigrationLog ml
-        WHERE ml.RemapID = r.RemapID AND ml.DocumentKey = dk.DocumentKey
-      )
-    ORDER BY dk.DocumentKey;
-
-    INSERT dbo.tbl_IMG_DocumentCategoryRemapMigrationLog
-          (RemapID, DocumentKey, FieldDataBeforeMigration, ModifiedBy, ModifiedOn, Status)
-    SELECT @RemapID, d.DocumentKey, dd.FieldData, 'test', SYSUTCDATETIME(), 'PROCESSING'
-    FROM @Docs d
-    JOIN dbo.tbl_IMG_DocumentData dd ON dd.DocumentKey = d.DocumentKey;
-
-    SELECT DocumentKey FROM @Docs;
-  END;
-
-  CREATE OR ALTER PROC dbo.usp_Remap_GetDocumentsXml
-    @DocKeys dbo.TVP_DocumentBatch READONLY
-  AS
-  BEGIN
-    SET NOCOUNT ON;
-    SELECT dd.DocumentKey, dd.FieldData
-    FROM dbo.tbl_IMG_DocumentData dd
-    JOIN @DocKeys k ON k.DocumentKey = dd.DocumentKey;
-  END;
-
-  CREATE OR ALTER PROC dbo.usp_Remap_ApplyBatch
-    @RemapID INT, @Items dbo.TVP_TransformedDocs READONLY
-  AS
-  BEGIN
-    SET NOCOUNT ON;
-
-    UPDATE dd
-      SET dd.FieldData = i.NewFieldData
-    FROM dbo.tbl_IMG_DocumentData dd
-    JOIN @Items i ON i.DocumentKey = dd.DocumentKey
-    WHERE i.Status = 'COMPLETED';
-
-    UPDATE dk
-       SET dk.DocDesc = LTRIM(RTRIM(
-         COALESCE(NULLIF(dk.DocDesc,''),'') +
-         CASE WHEN dk.DocDesc IS NULL OR dk.DocDesc='' THEN '' ELSE ' ' END +
-         i.AppendNote ))
-    FROM dbo.tbl_IMG_DocumentKeys dk
-    JOIN @Items i ON i.DocumentKey = dk.DocumentKey
-    WHERE i.Status = 'COMPLETED'
-      AND i.AppendNote IS NOT NULL
-      AND LEN(i.AppendNote) > 0;
-
-    UPDATE ml
-       SET ml.Status='COMPLETED', ml.ModifiedOn=SYSUTCDATETIME(), ml.ModifiedBy='test'
-    FROM dbo.tbl_IMG_DocumentCategoryRemapMigrationLog ml
-    JOIN @Items i ON i.DocumentKey = ml.DocumentKey
-    WHERE ml.RemapID = @RemapID;
-
-    UPDATE r
-       SET r.TotalDocuments     = r.TotalDocuments + (SELECT COUNT(*) FROM @Items),
-           r.ProcessedDocuments = r.ProcessedDocuments + (SELECT COUNT(*) FROM @Items WHERE Status='COMPLETED'),
-           r.ErroredDocuments   = r.ErroredDocuments + (SELECT COUNT(*) FROM @Items WHERE Status='ERROR'),
-           r.ModifiedOn         = SYSUTCDATETIME()
-    FROM dbo.tbl_IMG_DocumentCategoryRemap r
-    WHERE r.RemapID = @RemapID;
-  END;
-";
-}
-```
-
-## C) `Integration_EndToEnd_Tests.cs`
-
-```csharp
-using System.Data;
-using Dapper;
-using FluentAssertions;
-using Microsoft.Data.SqlClient;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using Remap.Core.Abstractions;
-using Remap.Core.Models;
-using Remap.Core.Services;
-using Remap.Infrastructure.Configuration;
-using Remap.Infrastructure.Data;
-using Remap.Infrastructure.Xml;
-using Xunit;
-
-public class Integration_EndToEnd_Tests : IClassFixture<MsSqlFixture>
-{
-    private readonly string _cs;
-
-    public Integration_EndToEnd_Tests(MsSqlFixture fx) => _cs = fx.ConnectionString;
-
-    [Fact]
-    public async Task Orchestrator_Processes_Batch_Updates_Xml_And_Logs()
-    {
-        // Arrange schema data
-        var sourceCat = Guid.NewGuid();
-        var targetCat = Guid.NewGuid();
-
-        await using (var con = new SqlConnection(_cs))
-        {
-            await con.OpenAsync();
-            // master
-            var remapId = await con.ExecuteScalarAsync<int>(@"
-              INSERT dbo.tbl_IMG_DocumentCategoryRemap(SourceCategoryKey, TargetCategoryKey, AppendUnmappedCategories, Status)
-              OUTPUT inserted.RemapID
-              VALUES (@s, @t, 1, 'READY');", new { s = sourceCat, t = targetCat });
-
-            // rules: Target1 <- Source2 (MAP), Target2 <- append(Source1), Target3 <- DISCARD
-            await con.ExecuteAsync(@"
-              INSERT dbo.tbl_IMG_DocumentCategoryRemapField(RemapID, TargetFieldNumber, Action, SourceFieldNumber, DefaultValue)
-              VALUES
-                (@r,1,'MAP',2,NULL),
-                (@r,2,'APPEND',1,''),
-                (@r,3,'DISCARD',NULL,NULL);", new { r = remapId });
-
-            // docs (3 docs)
-            var docs = Enumerable.Range(1, 3).Select(_ => Guid.NewGuid()).ToList();
-            foreach (var d in docs)
-            {
-                await con.ExecuteAsync(@"
-                  INSERT dbo.tbl_IMG_DocumentKeys(DocumentKey, CategoryKey, DocDesc) VALUES (@d, @c, NULL);
-                  INSERT dbo.tbl_IMG_DocumentData(DocumentKey, FieldData)
-                  VALUES (@d, '<FieldData><Field1>A</Field1><Field2>B</Field2><Field3>C</Field3></FieldData>');
-                ", new { d, c = sourceCat });
-            }
-        }
-
-        // Build real repo+transformer with DI (EF used only for master/rules if you wired it)
-        var services = new ServiceCollection();
-        services.AddLogging(b => b.AddConsole());
-        services.AddDbContext<RemapDbContext>(o => o.UseSqlServer(_cs));
-        services.Configure<InfrastructureOptions>(x => { x.MainConnectionString = _cs; x.CommandTimeoutSeconds = 120; });
-
-        services.AddSingleton<IRemapRepository, SqlRemapRepository>();
-        services.AddSingleton<IRemapTransformer, PositionalXmlTransformer>();
-        services.AddSingleton<IRemapOrchestrator, RemapOrchestrator>(); // uses RunOnceAsync(remapId,...)
-
-        var sp = services.BuildServiceProvider();
-        var orchestrator = sp.GetRequiredService<IRemapOrchestrator>();
-
-        // Act (process in one batch of 3)
-        await orchestrator.RunOnceAsync(remapId: 1, batchSize: 10, ct: default);
-
-        // Assert
-        await using var con2 = new SqlConnection(_cs);
-        var rows = (await con2.QueryAsync<(Guid DocumentKey, string Xml, string Desc)>(@"
-            SELECT d.DocumentKey, CAST(dd.FieldData AS NVARCHAR(MAX)) Xml, dk.DocDesc
-            FROM dbo.tbl_IMG_DocumentData dd
-            JOIN dbo.tbl_IMG_DocumentKeys dk ON dk.DocumentKey = dd.DocumentKey
-            JOIN dbo.tbl_IMG_DocumentCategoryRemap r ON r.SourceCategoryKey = dk.CategoryKey
-            JOIN dbo.tbl_IMG_DocumentCategoryRemapField rf ON rf.RemapID = r.RemapID
-            JOIN dbo.tbl_IMG_DocumentData d ON d.DocumentKey = dd.DocumentKey
-            WHERE r.RemapID = 1
-            GROUP BY d.DocumentKey, dd.FieldData, dk.DocDesc;")).ToList();
-
-        rows.Should().HaveCount(3);
-        foreach (var row in rows)
-        {
-            row.Xml.Should().Be("<FieldData><Field1>B</Field1><Field2></Field2><Field3></Field3></FieldData>");
-            row.Desc.Should().Be("A");
-        }
-
-        var logCount = await con2.ExecuteScalarAsync<int>(@"
-            SELECT COUNT(*) FROM dbo.tbl_IMG_DocumentCategoryRemapMigrationLog WHERE RemapID = 1 AND Status='COMPLETED'");
-        logCount.Should().Be(3);
-    }
-}
-```
-
-> If your orchestrator uses **RunOneGlobalCycleAsync** instead of `RunOnceAsync(remapId, …)`, adapt the act-phase to call that, and seed the DB with multiple remaps; the assertions are similar.
 
 ---
 
-# 3) What to test (checklist)
+Would you like me to help format these into talking points or a one-pager you can bring to the meeting?
 
-## Unit
 
-* **Transformer**:
+Here are a few more high-value points you can raise during the discovery session — these will make you sound thoughtful about architecture, scalability, and governance:
 
-  * MAP from existing and missing source nodes.
-  * DISCARD → empty target node.
-  * APPEND → DocDesc note composed; XML node default/empty.
-  * Default values honored; ordering positional.
-* **Orchestrator**:
-
-  * Splits batch into **N shards** by `Parallelism`; calls **ApplyBatch once per shard**.
-  * Handles exceptions: marks failed docs as ERROR in the batch payload.
-
-## Integration
-
-* **End-to-end happy path**: seed rules/docs → run → XML rewritten, DocDesc appended, logs written, counters updated.
-* **Append disabled** (`AppendUnmappedCategories=0`): ensure no DocDesc changes.
-* **Malformed XML**: one bad doc should mark ERROR and not block others.
-* **Idempotency**: running again doesn’t double-append or re-seed logs for completed docs.
 
 ---
 
-# 4) Running the tests
+🧩 4. Think About Versioning of Extraction Models
 
-* From VS Test Explorer or CLI: `dotnet test Remap.Tests`
-* Testcontainers will start SQL Server automatically; first run may take ~20–30s to pull the image.
+> “Should we plan for model versioning? For example, if we upgrade the invoice model later, how do we ensure older documents can still be reproduced?”
+
+
+
+Why this matters:
+
+Ensures auditability (important in finance)
+
+Avoids breaking existing workflows when upgrading models
+
+
 
 ---
 
-If you paste your **current orchestrator signature** (you mentioned `RunOneGlobalCycleAsync`) and repo interface (the new `ClaimNextGlobalBatchAsync` that returns `ClaimedWorkItem`), I can tailor the unit test to hit your exact methods (names + parameters) and include additional assertions for mixed RemapIDs in one global batch.
+🔐 5. Address Data Security & PII Handling Early
+
+> “Since invoices contain sensitive information, do we need encryption-at-rest, masking rules, or access tiers for different roles?”
+
+
+
+Why this matters:
+
+Shows awareness of compliance
+
+Forces early alignment with security teams
+
+Prevents rework later
+
+
+
+---
+
+🔁 6. Plan for a Human Review Workflow
+
+> “If the extraction confidence is low, do we need a workflow for humans to review, correct, and approve invoice data?”
+
+
+
+Why this matters:
+
+Increases accuracy
+
+Helps training future custom models
+
+Makes AI adoption smoother
+
+
+
+---
+
+🧪 7. Suggest a Pilot / MVP with Clear Success Metrics
+
+> “Which KPIs should we track during the MVP? Accuracy, time saved, throughput, manual correction rate?”
+
+
+
+Why this matters:
+
+Keeps the project outcome-focused
+
+Helps define what ‘good’ looks like
+
+Makes leadership happy
+
+
+
+---
+
+🛠️ 8. Identify Upstream/Downstream Integrations
+
+> “Where will the processed invoice data go? ERP? Finance system? Data lake?”
+
+
+
+Why this matters:
+
+Prevents integration surprises later
+
+Helps size the black box APIs correctly
+
+
+
+---
+
+🚀 9. Batch vs Real-Time Processing
+
+> “Do we expect invoices uploaded in bulk or one-by-one? Should we support both?”
+
+
+
+Why this matters:
+
+Affects architecture
+
+Impacts queueing, storage, and scaling
+
+
+
+---
+
+♻️ 10. Retention & Document Lifecycle
+
+> “How long do we keep the raw documents and extracted data? Are we expected to support retrieval later?”
+
+
+
+Why this matters:
+
+Important for compliance and storage planning
+
+Impacts cost
+
+
+
+---
+
+If you want, I can turn all of these into a quick talking-sheet for you to bring into the session.
