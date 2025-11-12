@@ -1,67 +1,27 @@
-What is Azure AI Vision?
+Discovery Session Script: Azure AI Vision vs Document Intelligence
 
-Azure AI Vision (formerly Computer Vision) is Microsoft’s service that helps computers see and understand images and videos — like how Document Intelligence helps with documents.
+"Hey everyone — just a quick explainer to clear up a common confusion around Azure's AI services, especially for those hearing about Azure AI Vision and Document Intelligence for the first time.
+
+Azure AI Vision is essentially Microsoft’s tool for helping machines see and understand the world — specifically, images and videos.
 
 Think of it as:
 
-📸 “AI for images and videos,”
-while Document Intelligence is
-📄 “AI for documents.”
+📸 AI for visual content — recognizing objects, reading text, detecting faces, analyzing video, and even flagging inappropriate content.
 
-👀 What Azure AI Vision can do
+Now, Document Intelligence — which some of you may already be using — is actually a specialized branch of Azure AI Vision. Its focus? Documents like forms, invoices, receipts, and IDs.
 
-Here’s what AI Vision can actually do for you:
+So while Vision looks at a photo and says:
 
-Image recognition
+“This image contains text and a restaurant logo.”
 
-Identify what’s in a picture — e.g., “a dog,” “a car,” “a person riding a bike.”
+Document Intelligence goes a step further and says:
 
-Text reading (OCR)
+“Vendor: Pizza Place. Date: Feb 10. Total: $18.75.”
 
-Read text from images or photos (e.g., signs, labels, screenshots).
+To sum it up:
 
-Same OCR (Optical Character Recognition) tech as Document Intelligence uses, but broader — not specific to forms.
+Vision = general images/videos
 
-Object detection
+Document Intelligence = structured documents
 
-Detect where things are in an image (e.g., bounding boxes around faces, logos, or items).
-
-Facial recognition (with privacy rules)
-
-Detect and analyze faces (age, emotion, or identity — within policy limits).
-
-Video analysis
-
-Track movement, detect activities, or extract frames with specific objects or people.
-
-Content moderation
-
-Automatically detect nudity, violence, or offensive imagery.
-
-📄 vs 📸 The Key Difference: Document Intelligence vs AI Vision
-Feature	Azure AI Document Intelligence	Azure AI Vision
-Focus	Structured documents (forms, invoices, IDs, receipts)	General images and videos
-Goal	Extract meaningful data (fields, tables, values)	Understand visual content (objects, people, scenes)
-Input	PDFs, scanned forms, images of documents	Photos, videos, or any general image
-Output	Structured text/data (e.g., “InvoiceNumber: 12345”)	Tags, captions, object locations, or text-in-image
-Best for	Automating paperwork, data entry	Image recognition, security, media analytics
-🔗 Relationship between the two
-
-They’re both part of Azure AI Services, under the Vision family.
-You can think of it like this hierarchy:
-
-Azure AI Services
-➜ Azure AI Vision (for seeing the world)
-    ↳ Document Intelligence (specialized in reading structured documents)
-
-So technically, Document Intelligence is a specialized branch of Vision, trained to understand the layout and logic of documents rather than just “what’s in the picture.”
-
-💡 Example:
-
-If you upload a photo of a restaurant receipt:
-
-AI Vision might say: “This image contains text and a logo, maybe a restaurant bill.”
-
-Document Intelligence will say: “Vendor: Pizza Place, Date: Feb 10, Total: $18.75, Tax: $2.25.”
-
-Would you like me to make a quick diagram or visual analogy showing how Vision → Document Intelligence fits together in Azure AI’s ecosystem? It makes the relationship crystal clear.
+Both are part of Azure AI Services, and they complement each other perfectly depending on your use case — whether you're building solutions for document automation or analyzing real-world visuals.
