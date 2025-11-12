@@ -1,144 +1,89 @@
-Great—here’s exactly what you asked for: a **global claim** stored procedure that returns the rows you need for `ClaimedWorkItem` (one row per document, including the `RemapID`), plus the **repository method** that calls it and maps to your `ClaimedWorkItem` type.
+What is Azure AI Document Intelligence?
+It’s a Microsoft cloud service that can read, understand, and extract information from documents automatically — like invoices, receipts, contracts, bank statements, forms, and even handwritten notes.
+Think of it as a super-smart scanner that doesn’t just take pictures — it understands what’s inside.
 
----
+⚙️ What it can do for you
+Here’s what it can actually help you with:
 
-# 1) SQL: Global claim across RemapIDs (randomized), with logging & backup
 
-This version:
+📄 Read documents automatically
 
-* Takes **only** `@BatchSize` (no SiteCode parameter).
-* Selects documents **across many RemapIDs** whose **master status is READY**.
-* Ensures **tenant safety** by joining on `SiteCode` (assuming both tables have it).
-* **Seeds the migration log** (PROCESSING) and **backs up** the current XML in one shot.
-* Returns exactly the two columns you need: **`RemapID`, `DocumentKey`** (your `ClaimedWorkItem`).
 
-```sql
-CREATE OR ALTER PROC dbo.usp_Remap_ClaimNextGlobalBatch
-    @BatchSize INT
-AS
-BEGIN
-    SET NOCOUNT ON;
+It can recognize printed or handwritten text, tables, and checkboxes.
 
-    /* Pick a randomized global batch across many remaps */
-    ;WITH ToClaim AS
-    (
-        SELECT TOP (@BatchSize)
-               r.RemapID,
-               dk.DocumentKey
-        FROM dbo.tbl_IMG_DocumentCategoryRemap            AS r   WITH (READPAST)
-        JOIN dbo.tbl_IMG_DocumentKeys                     AS dk  WITH (READPAST)
-             ON dk.CategoryKey = r.SourceCategoryKey
-            AND dk.SiteCode    = r.SiteCode               -- tenant safety
-        WHERE r.Status = 'READY'
-          AND NOT EXISTS
-              ( SELECT 1
-                FROM dbo.tbl_IMG_DocumentCategoryRemapMigrationLog AS ml
-                WHERE ml.RemapID    = r.RemapID
-                  AND ml.DocumentKey = dk.DocumentKey )
-        ORDER BY NEWID()   -- randomize so multiple remaps get progress concurrently
-    )
-    /* Seed log rows (PROCESSING) and back up current XML */
-    INSERT dbo.tbl_IMG_DocumentCategoryRemapMigrationLog
-          (RemapID, DocumentKey, FieldDataBeforeMigration, Status, ModifiedBy, ModifiedOn)
-    SELECT t.RemapID,
-           t.DocumentKey,
-           dd.FieldData,
-           'PROCESSING',
-           SUSER_SNAME(),
-           SYSUTCDATETIME()
-    FROM ToClaim t
-    JOIN dbo.tbl_IMG_DocumentData AS dd
-         ON dd.DocumentKey = t.DocumentKey;
 
-    /* Return exactly what the worker needs for ClaimedWorkItem */
-    SELECT RemapID, DocumentKey
-    FROM ToClaim;
-END
-GO
-```
+Works with PDFs, images, or scanned papers.
 
-> If **`SiteCode`** is not present on one of the tables, drop that join predicate. If you store tenant on a different table, move the predicate accordingly—the key is: **the SP enforces tenant alignment internally**, while still taking **only** `@BatchSize`.
 
----
 
-# 2) Core model: `ClaimedWorkItem`
 
-Place this in **Remap.Core/Models/ClaimedWorkItem.cs**:
+🔍 Extract useful information
 
-```csharp
-namespace Remap.Core.Models;
 
-public sealed record ClaimedWorkItem(int RemapId, Guid DocumentKey);
-```
+Example: From an invoice, it can pull out “Invoice Number,” “Date,” “Total Amount,” and “Vendor Name” without you typing anything.
 
----
 
-# 3) Repository method: `ClaimNextGlobalBatchAsync`
+From an ID card, it can grab the person’s name, DOB, and address.
 
-Add this to your existing **`SqlRemapRepository`** (in **Remap.Infrastructure**).
-This calls the new SP and maps the resultset into `List<ClaimedWorkItem>`.
 
-```csharp
-using System.Data;
-using Microsoft.Data.SqlClient;
-using Microsoft.Extensions.Options;
-using Microsoft.Extensions.Logging;
-using Remap.Core.Models;
-using Remap.Core.Abstractions;
 
-namespace Remap.Infrastructure.Data
-{
-    public sealed partial class SqlRemapRepository : IRemapRepository
-    {
-        // ... existing fields/ctor ...
 
-        public async Task<IReadOnlyList<ClaimedWorkItem>> ClaimNextGlobalBatchAsync(int batchSize, CancellationToken ct)
-        {
-            var items = new List<ClaimedWorkItem>(capacity: batchSize);
+🤖 Automate repetitive tasks
 
-            await using var con = new SqlConnection(_cs);
-            await con.OpenAsync(ct);
 
-            using var cmd = new SqlCommand("dbo.usp_Remap_ClaimNextGlobalBatch", con)
-            {
-                CommandType = CommandType.StoredProcedure,
-                CommandTimeout = _timeout
-            };
-            cmd.Parameters.AddWithValue("@BatchSize", batchSize);
+Instead of manually entering data from 100 invoices into Excel, Azure AI can read all of them and give you structured data (like JSON or Excel output).
 
-            using var rdr = await cmd.ExecuteReaderAsync(ct);
-            while (await rdr.ReadAsync(ct))
-            {
-                // Resultset: RemapID (int), DocumentKey (uniqueidentifier)
-                int remapId    = rdr.GetInt32(0);
-                Guid docKey    = rdr.GetGuid(1);
-                items.Add(new ClaimedWorkItem(remapId, docKey));
-            }
 
-            return items;
-        }
-    }
-}
-```
+You can plug that data into your database, app, or workflow.
 
-> If your `IRemapRepository` didn’t have this yet, add to the interface in **Remap.Core/Abstractions/IRemapRepository.cs**:
 
-```csharp
-Task<IReadOnlyList<ClaimedWorkItem>> ClaimNextGlobalBatchAsync(int batchSize, CancellationToken ct);
-```
 
----
 
-## How you’ll use it (context)
+🧾 Work with specific document types
 
-* Call `ClaimNextGlobalBatchAsync(batchSize)` once per **global cycle**.
-* You’ll receive a **flat list** of mixed work (many `RemapID`s).
-* **Do not** group by `RemapID`.
-  Instead, **shard by parallelism** (e.g., 1000 batch, parallelism 4 ⇒ 4 shards of ~250).
-  Each shard independently:
 
-  1. fetches the docs’ XML for its keys,
-  2. transforms,
-  3. **applies once** (one `ApplyBatchAsync` call) for that shard.
+It comes with pre-built models for common forms (like invoices, receipts, business cards, IDs).
 
-That satisfies your requirement: **no RemapID iteration**, **multi-tenant safety**, and **only 4 DB writes** for a 1000-size batch with parallelism 4.
+
+You can also train custom models to understand your own documents (for example, your company’s loan forms or client onboarding sheets).
+
+
+
+
+🌐 Integrate easily
+
+
+You can connect it to Power Automate, Logic Apps, or your own C#/Python/JavaScript app.
+
+
+Great for creating “no-manual-data-entry” workflows.
+
+
+
+
+
+💡 Real-life examples
+
+
+Finance: Auto-extract totals and vendor names from invoices.
+
+
+HR: Scan job applications and extract candidate info.
+
+
+Banking: Read mortgage documents or KYC forms.
+
+
+Legal: Summarize contracts or detect key terms.
+
+
+Personal: Scan and organize bills, receipts, or ID cards.
+
+
+
+In short:
+
+Azure AI Document Intelligence = AI that reads your documents, pulls out the important bits, and saves you hours of manual typing.
+
+
+Would you like me to show you a practical example — say, how it could extract invoice data and send it to Excel or a database automatically?
