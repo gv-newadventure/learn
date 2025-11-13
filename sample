@@ -1,87 +1,7 @@
-You’re hitting the classic **“cannot consume scoped service from singleton”** problem.
-The good news: you don’t need to change your EF or repository code – just the **DI registrations and the worker**.
-
-Below are the updated files you need.
-
----
-
-## 1. `Remap.Core` – options + orchestrator interface
-
-These are just for context so the Worker code compiles.
-
-### `Remap.Core/Configuration/RemapOptions.cs`
-
-```csharp
-namespace Remap.Core.Configuration
-{
-    // Bound from configuration section "Remap"
-    public sealed class RemapOptions
-    {
-        public int BatchSize { get; set; } = 1000;
-        public int Parallelism { get; set; } = 4;
-
-        // optional: how often the worker polls
-        public int PollSeconds { get; set; } = 30;
-    }
-}
-```
-
-### `Remap.Core/Abstractions/IRemapOrchestrator.cs`
-
-```csharp
-using System.Threading;
-using System.Threading.Tasks;
-
-namespace Remap.Core.Abstractions
-{
-    public interface IRemapOrchestrator
-    {
-        /// <summary>
-        /// Runs one global cycle: claims a batch across all READY remaps,
-        /// processes it (with internal parallelism), and applies the results.
-        /// </summary>
-        Task RunOneGlobalCycleAsync(CancellationToken cancellationToken);
-    }
-}
-```
-
-*(Your existing orchestrator implementation can stay as-is; just make sure it implements this interface.)*
-
----
-
-## 2. `Remap.Infrastructure` – options (unchanged, just for clarity)
-
-### `Remap.Infrastructure/Configuration/InfrastructureOptions.cs`
-
-```csharp
-namespace Remap.Infrastructure.Configuration
-{
-    public sealed class InfrastructureOptions
-    {
-        public string MainConnectionString { get; set; } = string.Empty;
-        public int CommandTimeoutSeconds { get; set; } = 120;
-    }
-}
-```
-
----
-
-## 3. `Remap.Worker` – **Program.cs** (fixed DI)
-
-Here’s a full `Program.cs` that:
-
-* Registers **DbContext as scoped**
-* Registers **repository + transformer + orchestrator as scoped**
-* Registers the **BackgroundService** (`RemapWorker`) as hosted service
-* Wires up logging & config
-
-```csharp
-// Remap.Worker/Program.cs
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Remap.Core.Abstractions;
-using Remap.Core.Configuration;
 using Remap.Core.Services;
 using Remap.Infrastructure.Configuration;
 using Remap.Infrastructure.Data;
@@ -89,206 +9,35 @@ using Serilog;
 
 var builder = Host.CreateApplicationBuilder(args);
 
-// Configuration
-builder.Configuration
-       .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-       .AddEnvironmentVariables();
+// --- Options ---
+builder.Services.Configure<InfrastructureOptions>(
+    builder.Configuration.GetSection("Infrastructure"));
+builder.Services.Configure<RemapOptions>(
+    builder.Configuration.GetSection("Remap"));
 
-// Logging (Serilog to console)
+// --- EF Core DbContext ---
+builder.Services.AddDbContext<RemapDbContext>(options =>
+    options.UseSqlServer(
+        builder.Configuration.GetSection("Infrastructure")["MainConnectionString"])
+);
+
+// --- DI registrations (SCOPED, not singleton!) ---
+builder.Services.AddScoped<IRemapRepository, SqlRemapRepository>();
+builder.Services.AddScoped<IRemapTransformer, PositionalXmlTransformer>();
+builder.Services.AddScoped<IRemapOrchestrator, RemapOrchestrator>();
+
+// Hosted worker
+builder.Services.AddHostedService<RemapWorker>();
+
+// --- Serilog basic console logger (no ReadFrom.Configuration) ---
 Log.Logger = new LoggerConfiguration()
-    .ReadFrom.Configuration(builder.Configuration)
+    .MinimumLevel.Information()
     .Enrich.FromLogContext()
     .WriteTo.Console()
     .CreateLogger();
 
 builder.Logging.ClearProviders();
-builder.Logging.AddSerilog(Log.Logger);
-
-// Options binding
-builder.Services.Configure<InfrastructureOptions>(
-    builder.Configuration.GetSection("Infrastructure"));
-
-builder.Services.Configure<RemapOptions>(
-    builder.Configuration.GetSection("Remap"));
-
-// DbContext (SCOPED)
-builder.Services.AddDbContext<RemapDbContext>(options =>
-{
-    var conn = builder.Configuration["Infrastructure:MainConnectionString"];
-    options.UseSqlServer(conn);
-});
-
-// Core / Infrastructure services (SCOPED)
-builder.Services.AddScoped<IRemapRepository, SqlRemapRepository>();
-builder.Services.AddScoped<IRemapTransformer, PositionalXmlTransformer>();
-builder.Services.AddScoped<IRemapOrchestrator, RemapOrchestrator>();
-
-// Background worker (singleton hosted service that creates scopes)
-builder.Services.AddHostedService<RemapWorker>();
+builder.Logging.AddSerilog(Log.Logger, dispose: true);
 
 var host = builder.Build();
-
 await host.RunAsync();
-```
-
-> 🔑 Important change: `IRemapRepository`, `IRemapTransformer`, `IRemapOrchestrator` are now **scoped**, not singleton.
-> The worker will create a **scope per cycle** and resolve the orchestrator from there.
-
----
-
-## 4. `Remap.Worker` – **RemapWorker.cs** (create scope per cycle)
-
-This removes the lifetime mismatch by **not injecting the orchestrator directly**.
-
-```csharp
-// Remap.Worker/RemapWorker.cs
-using System;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-using Remap.Core.Abstractions;
-using Remap.Core.Configuration;
-
-namespace Remap.Worker
-{
-    public sealed class RemapWorker : BackgroundService
-    {
-        private readonly IServiceScopeFactory _scopeFactory;
-        private readonly ILogger<RemapWorker> _logger;
-        private readonly RemapOptions _options;
-
-        public RemapWorker(
-            IServiceScopeFactory scopeFactory,
-            IOptions<RemapOptions> options,
-            ILogger<RemapWorker> logger)
-        {
-            _scopeFactory = scopeFactory;
-            _logger = logger;
-            _options = options.Value;
-        }
-
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-        {
-            _logger.LogInformation("RemapWorker starting with BatchSize={BatchSize}, Parallelism={Parallelism}",
-                _options.BatchSize, _options.Parallelism);
-
-            while (!stoppingToken.IsCancellationRequested)
-            {
-                try
-                {
-                    using (var scope = _scopeFactory.CreateScope())
-                    {
-                        var orchestrator = scope.ServiceProvider
-                            .GetRequiredService<IRemapOrchestrator>();
-
-                        await orchestrator.RunOneGlobalCycleAsync(stoppingToken);
-                    }
-                }
-                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-                {
-                    // graceful shutdown
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Unexpected error in RemapWorker cycle.");
-                }
-
-                // simple polling interval between cycles
-                var delaySeconds = Math.Max(1, _options.PollSeconds);
-                await Task.Delay(TimeSpan.FromSeconds(delaySeconds), stoppingToken);
-            }
-
-            _logger.LogInformation("RemapWorker stopping.");
-        }
-    }
-}
-```
-
-This is the key to fixing the error in your screenshot:
-
-> *“Cannot consume scoped service 'Remap.Infrastructure.Data.RemapDbContext' from singleton 'Remap.Core.Abstractions.IRemapRepository'”*
-
-Now the **DbContext**, repository and orchestrator all live **inside a scope**, created per cycle by the worker.
-
----
-
-## 5. (Optional) `Remap.Functions` Program.cs (same DI pattern)
-
-If you’re also running the **Azure Functions isolated worker**, it should use **scoped** services too. A full Program for that:
-
-```csharp
-// Remap.Functions/Program.cs
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Remap.Core.Abstractions;
-using Remap.Core.Configuration;
-using Remap.Core.Services;
-using Remap.Infrastructure.Configuration;
-using Remap.Infrastructure.Data;
-
-var host = new HostBuilder()
-    .ConfigureFunctionsWorkerDefaults()
-    .ConfigureAppConfiguration((ctx, cfg) =>
-    {
-        cfg.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-           .AddEnvironmentVariables();
-    })
-    .ConfigureServices((ctx, services) =>
-    {
-        services.Configure<InfrastructureOptions>(
-            ctx.Configuration.GetSection("Infrastructure"));
-
-        services.Configure<RemapOptions>(
-            ctx.Configuration.GetSection("Remap"));
-
-        services.AddDbContext<RemapDbContext>(options =>
-        {
-            var cs = ctx.Configuration["Infrastructure:MainConnectionString"];
-            options.UseSqlServer(cs);
-        });
-
-        services.AddScoped<IRemapRepository, SqlRemapRepository>();
-        services.AddScoped<IRemapTransformer, PositionalXmlTransformer>();
-        services.AddScoped<IRemapOrchestrator, RemapOrchestrator>();
-    })
-    .Build();
-
-await host.RunAsync();
-```
-
-Functions automatically create a **scope per trigger invocation**, so scoped services are safe.
-
----
-
-## 6. Quick sanity checklist
-
-After updating these files:
-
-1. **Clean + Rebuild** solution.
-2. Make sure **Remap.Worker** is the startup project.
-3. Confirm `appsettings.json` has the required sections:
-
-   ```json
-   {
-     "Infrastructure": {
-       "MainConnectionString": "Server=...;Database=...;Trusted_Connection=True;",
-       "CommandTimeoutSeconds": 120
-     },
-     "Remap": {
-       "BatchSize": 1000,
-       "Parallelism": 4,
-       "PollSeconds": 30
-     }
-   }
-   ```
-4. Run **Remap.Worker** again. The DI error about `RemapDbContext` should be gone, and you should see log messages from the worker and orchestrator.
-
----
-
-If you paste your current **RemapOrchestrator** and **SqlRemapRepository** I can double-check they line up with the new DI pattern and your `ClaimNextGlobalBatchAsync` design—but the lifetimes above are the core fix you needed.
