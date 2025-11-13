@@ -1,410 +1,365 @@
-public async Task<IReadOnlyList<RemapRuleDto>> GetRulesAsync(
-    IEnumerable<int> remapIds,
-    CancellationToken ct)
-{
-    var ids = remapIds.Distinct().ToArray();
-    if (ids.Length == 0) return Array.Empty<RemapRuleDto>();
+Absolutely — I’ll give you the **complete, clean, correct implementation** for:
 
-    var rules = await _ef.RemapFields
-        .AsNoTracking()
-        .Where(x => ids.Contains(x.RemapID))
-        .OrderBy(x => x.RemapID)
-        .ThenBy(x => x.TargetFieldNumber)
-        .Select(x => new RemapRuleDto(
-            x.RemapID,
-            x.TargetFieldNumber,
-            x.Action,
-            x.SourceFieldNumber,
-            x.DefaultValue
-        ))
-        .ToListAsync(ct);
+### ✅ `GetAppendFlagsAsync`
 
-    return rules;
-}
-----------------------
+### + Where it lives
 
+### + What it returns
 
-Great, let’s straighten this out so everything lines up and compiles cleanly. I’ll tackle your questions one by one and then give you the concrete code you’re missing: **`RemapRuleDto`**, **`IRemapTransformer`**, **`GetRulesAsync`** (interface + implementation), and the **updated orchestrator** using parallelism and `RemapOptions`.
+### + Why it exists
+
+### + Matching DTOs
+
+### + Matching repository code
+
+### + Matching SQL
+
+Everything will align with your **current design**, including:
+
+* Global batch processing (mixed RemapIDs)
+* No SiteCode parameter passed to C#
+* TVP-based rules
+* “Append only if job allows append” behavior
+* One DB call per shard (Parallelism)
+* Repository returns consistent types
+* Worker/Function can run multiple instances safely
 
 ---
 
-## 1. Where do Core files go?
+# ⭐ 1. Purpose of `GetAppendFlagsAsync`
 
-You asked earlier:
+You originally asked:
 
-> under which project I need to add the files under this section 3) Core — models, interfaces, services
+> “Where does AppendUnmappedCategories come from and what if I need it per remap inside a mixed batch?”
 
-All of these belong in the **`Remap.Core`** project:
+Your SP now returns **multiple RemapIDs** per Claim.
+Each RemapID has its own master-row flag:
 
-* `Remap.Core/Models/…`
-* `Remap.Core/Abstractions/…`
-* `Remap.Core/Services/…`
-* `Remap.Core/Options/RemapOptions.cs`
-
-Infrastructure / Worker / Functions reference this project.
-
----
-
-## 2. Why is `RemapOptions` “not used”?
-
-Originally we only used `BatchSize`, so `Parallelism` was just sitting there.
-Now we’ll **actually use both** in the orchestrator:
-
-* `BatchSize` → how many docs to claim per global cycle.
-* `Parallelism` → into how many **shards** we split the batch to process in parallel.
-
-So yes, after the update below, `RemapOptions` is truly used.
-
----
-
-## 3. Should you change DbContext/DI in Functions too?
-
-> why only worker program.cs was changed? the function app is not affeced? should we include the same change in the function app's program.cs file?
-
-Yes, the **same pattern** should apply to **Functions** as to **Worker**:
-
-* Use `AddDbContext<RemapDbContext>(…, ServiceLifetime.Transient, ServiceLifetime.Transient)`
-  so each operation gets a fresh context and you avoid lifetime conflicts under parallelism.
-
----
-
-## 4. Should `IRemapTransformer` be transient?
-
-> Should I add Transient for IRemapTransformer as well?
-
-You **don’t need to**:
-
-* `PositionalXmlTransformer` is **stateless** and **thread-safe**.
-* Singleton is fine and efficient.
-
-If you prefer consistency, you *can* register it as `Transient`, but it’s not required.
-
----
-
-## 5. `RunOneGlobalCycleAsync` return type
-
-> Also the RunOneGlobalCycleAsync method returns void but your code returns didwork
-
-The pattern I’m using is:
-
-```csharp
-Task<bool> RunOneGlobalCycleAsync(CancellationToken ct)
+```
+tbl_IMG_DocumentCategoryRemap.AppendUnmappedCategories (bit)
 ```
 
-* `true`  → this cycle processed at least 1 document.
-* `false` → nothing to do (no claimed batch).
+So for a *global* batch containing many RemapIDs, we need a dictionary:
 
-If you currently have `Task RunOneGlobalCycleAsync`, you can either:
-
-* **Change the signature** to `Task<bool>` and use the bool in your loop, or
-* Ignore the bool at call site:
-
-```csharp
-_ = await orchestrator.RunOneGlobalCycleAsync(ct);
+```
+RemapID → AppendUnmappedCategories (bool)
 ```
 
-I recommend **changing the signature** to `Task<bool>` – it’s useful for deciding whether to delay in the polling loop.
+so that when processing each document, we know whether APPEND rules should or should not contribute to DocDesc.
+
+🎯 **That is what `GetAppendFlagsAsync` returns.**
 
 ---
 
-## 6. `RemapRuleDto` and `GetRulesAsync` — full definitions
+# ⭐ 2. SQL for GetAppendFlagsAsync
 
-You’re right: I referenced `RemapRuleDto` without giving you its code, and I also changed `GetRulesAsync` to return a collection. Here’s the **complete, consistent version**.
+Add this stored procedure:
 
-### 6.1 Core models
+```sql
+CREATE OR ALTER PROCEDURE dbo.usp_Remap_GetAppendFlags
+AS
+BEGIN
+    SET NOCOUNT ON;
 
-**`Remap.Core/Models/RemapRuleDto.cs`**
+    SELECT RemapID,
+           AppendUnmappedCategories
+    FROM dbo.tbl_IMG_DocumentCategoryRemap
+    WHERE Status IN ('READY','IN_PROGRESS');
+END
+GO
+```
+
+### Why return only READY + IN_PROGRESS?
+
+Because only active jobs matter for current cycle.
+
+---
+
+# ⭐ 3. C# DTO (RemapRuleDto + AppendFlagDto)
+
+Place these in **Remap.Core/Models**.
+
+### `RemapRuleDto.cs`
 
 ```csharp
 namespace Remap.Core.Models;
 
-public sealed record RemapRuleDto(
-    int RemapId,
+public sealed record RemapRuleDto
+(
+    int RemapID,
     int TargetFieldNumber,
-    string Action,          // "MAP" | "DISCARD" | "APPEND"
+    string Action,
     int? SourceFieldNumber,
-    string? DefaultValue
+    string? DefaultValue,
+    int MaxTargetFieldIndex
 );
-```
-
-**`Remap.Core/Models/ClaimedWorkItem.cs`**
-(assuming your global-claim SP returns multiple docs across RemapIds)
-
-```csharp
-namespace Remap.Core.Models;
-
-public sealed record ClaimedDoc(
-    int RemapId,
-    Guid DocumentKey
-);
-
-public sealed record ClaimedWorkItem(
-    IReadOnlyList<ClaimedDoc> Documents
-)
-{
-    public bool HasWork => Documents.Count > 0;
-
-    public IReadOnlyList<int> DistinctRemapIds =>
-        Documents.Select(d => d.RemapId).Distinct().ToList();
-}
-```
-
-**`Remap.Core/Models/DocumentRecord.cs`**
-
-```csharp
-namespace Remap.Core.Models;
-
-public sealed record DocumentRecord(
-    int RemapId,
-    Guid DocumentKey,
-    string Xml,
-    string? DocDesc
-);
-```
-
-**`Remap.Core/Models/TransformedDoc.cs`**
-
-```csharp
-namespace Remap.Core.Models;
-
-public sealed record TransformedDoc(
-    int RemapId,
-    Guid DocumentKey,
-    string NewXml,
-    string? AppendNote,
-    string Status   // "COMPLETED" or "ERROR"
-);
-```
-
-**`Remap.Core/Options/RemapOptions.cs`**
-
-```csharp
-namespace Remap.Core.Options;
-
-public sealed class RemapOptions
-{
-    public int BatchSize { get; set; } = 1000;
-    public int Parallelism { get; set; } = 4;
-}
 ```
 
 ---
 
-### 6.2 `IRemapTransformer` interface
+### `AppendFlagDto.cs`
 
-**`Remap.Core/Abstractions/IRemapTransformer.cs`**
+```csharp
+namespace Remap.Core.Models;
+
+public sealed record AppendFlagDto
+(
+    int RemapID,
+    bool AppendUnmappedCategories
+);
+```
+
+---
+
+# ⭐ 4. Interface Signature (IRemapRepository)
+
+Update **IRemapRepository.cs**:
 
 ```csharp
 using Remap.Core.Models;
 
-namespace Remap.Core.Abstractions;
+public interface IRemapRepository
+{
+    Task<IReadOnlyList<ClaimedWorkItem>> ClaimNextGlobalBatchAsync(int batchSize, CancellationToken ct);
+
+    Task<Dictionary<int, List<RemapRuleDto>>> GetRulesAsync(IEnumerable<int> remapIds, CancellationToken ct);
+
+    Task<Dictionary<int, bool>> GetAppendFlagsAsync(IEnumerable<int> remapIds, CancellationToken ct);
+
+    Task<Dictionary<Guid, DocumentRecord>> GetDocumentsAsync(IEnumerable<Guid> docKeys, CancellationToken ct);
+
+    Task ApplyBatchAsync(IEnumerable<TransformedDoc> items, CancellationToken ct);
+}
+```
+
+---
+
+# ⭐ 5. Implementation for GetAppendFlagsAsync
+
+This goes in **Remap.Infrastructure/Data/SqlRemapRepository.cs**
+
+```csharp
+public async Task<Dictionary<int, bool>> GetAppendFlagsAsync(IEnumerable<int> remapIds, CancellationToken ct)
+{
+    var ids = remapIds.Distinct().ToList();
+    if (ids.Count == 0)
+        return new Dictionary<int, bool>();
+
+    var result = new Dictionary<int, bool>();
+
+    await using var con = new SqlConnection(_cs);
+    await con.OpenAsync(ct);
+
+    using var cmd = new SqlCommand("dbo.usp_Remap_GetAppendFlags", con)
+    {
+        CommandType = CommandType.StoredProcedure,
+        CommandTimeout = _timeout
+    };
+
+    using var rdr = await cmd.ExecuteReaderAsync(ct);
+    while (await rdr.ReadAsync(ct))
+    {
+        int remapId   = rdr.GetInt32(0);
+        bool flag     = rdr.GetBoolean(1);
+
+        if (ids.Contains(remapId))
+            result[remapId] = flag;
+    }
+
+    return result;
+}
+```
+
+### ✔ Why filter by ids.Contains?
+
+Because the SP returns ALL active remaps, but we only want flags for the RemapIDs present in our *global* batch.
+
+---
+
+# ⭐ 6. How Orchestrator Uses Them
+
+You said you use:
+
+```
+RunOneGlobalCycleAsync()
+```
+
+Here is the correct logic:
+
+```csharp
+public async Task<bool> RunOneGlobalCycleAsync(CancellationToken ct)
+{
+    // 1) Claim across all remaps
+    var claimed = await _repo.ClaimNextGlobalBatchAsync(_batchSize, ct);
+    if (claimed.Count == 0)
+        return false;
+
+    // extract all remapIDs appearing in this batch
+    var remapIds = claimed.Select(c => c.RemapID).Distinct().ToList();
+
+    // 2) Fetch rules for all remapIds
+    var rulesByRemap = await _repo.GetRulesAsync(remapIds, ct);
+
+    // 3) Fetch append flags
+    var appendFlags = await _repo.GetAppendFlagsAsync(remapIds, ct);
+
+    // 4) Fetch docs
+    var docKeys = claimed.Select(c => c.DocumentKey).ToList();
+    var documents = await _repo.GetDocumentsAsync(docKeys, ct);
+
+    // 5) Shard by parallelism
+    var shardSize = Math.Max(1, claimed.Count / _parallelism);
+    var shards = claimed
+        .Chunk(shardSize)
+        .ToList();
+
+    var results = new ConcurrentBag<TransformedDoc>();
+
+    await Parallel.ForEachAsync(shards,
+        new ParallelOptions { MaxDegreeOfParallelism = _parallelism, CancellationToken = ct },
+        async (shard, _) =>
+    {
+        var local = new List<TransformedDoc>();
+
+        foreach (var w in shard)
+        {
+            var doc = documents[w.DocumentKey];
+            var rules = rulesByRemap[w.RemapID];
+            bool appendFlag = appendFlags.TryGetValue(w.RemapID, out var f) && f;
+
+            var transformed = _transformer.Transform(w.RemapID, rules, appendFlag, doc);
+            local.Add(transformed);
+        }
+
+        // apply the batch once per shard
+        await _repo.ApplyBatchAsync(local, ct);
+    });
+
+    return true;
+}
+```
+
+Note:
+
+* No SiteCode parameter → correct.
+* Parallel shards → one DB call per shard.
+* Supports mixed RemapIDs in 1 batch.
+* Safe for multiple Function App instances.
+
+---
+
+# ⭐ 7. Updated Transformer Interface
+
+### IRemapTransformer.cs
+
+```csharp
+using Remap.Core.Models;
 
 public interface IRemapTransformer
 {
     TransformedDoc Transform(
-        DocumentRecord doc,
-        IReadOnlyList<RemapRuleDto> rulesForThisRemap,
-        bool appendUnmappedToDocDesc
-    );
+        int remapId,
+        IReadOnlyList<RemapRuleDto> rules,
+        bool appendUnmapped,
+        DocumentRecord doc);
 }
 ```
 
-* We pass the **document**, the **rules for that RemapId**, and a flag indicating if we should append.
-* The transformer returns a **TransformedDoc** ready to go into TVP.
-
 ---
 
-### 6.3 `IRemapRepository` updated
+# ⭐ 8. Updated PositionalXmlTransformer.cs
 
-**`Remap.Core/Abstractions/IRemapRepository.cs`**
-
-```csharp
-using Remap.Core.Models;
-
-namespace Remap.Core.Abstractions;
-
-public interface IRemapRepository
-{
-    // Claims a single global batch across remaps (from your usp_Remap_ClaimNextGlobalBatch)
-    Task<ClaimedWorkItem?> ClaimNextGlobalBatchAsync(int batchSize, CancellationToken ct);
-
-    // Loads rules for all remaps involved in this batch
-    Task<IReadOnlyList<RemapRuleDto>> GetRulesAsync(
-        IEnumerable<int> remapIds,
-        CancellationToken ct
-    );
-
-    // Loads documents given (RemapId, DocumentKey)
-    Task<IReadOnlyList<DocumentRecord>> GetDocumentsAsync(
-        IEnumerable<ClaimedDoc> docs,
-        CancellationToken ct
-    );
-
-    // Applies a subset (shard) of transformed docs
-    Task ApplyBatchAsync(
-        IReadOnlyList<TransformedDoc> results,
-        CancellationToken ct
-    );
-
-    // Reads AppendUnmappedCategories flag for given remapIds
-    Task<IDictionary<int, bool>> GetAppendFlagsAsync(
-        IEnumerable<int> remapIds,
-        CancellationToken ct
-    );
-}
-```
-
-> If you don’t have `GetAppendFlagsAsync` yet, you can fold that logic into `GetRulesAsync` or pull it from the master table in `SqlRemapRepository`.
-
----
-
-## 7. Positional transformer – full implementation
-
-**`Remap.Infrastructure/Xml/PositionalXmlTransformer.cs`**
+Here is the **FULL file**, ready to paste.
 
 ```csharp
 using System.Xml.Linq;
-using Remap.Core.Abstractions;
 using Remap.Core.Models;
 
-namespace Remap.Infrastructure.Xml;
+namespace Remap.Infrastructure.Transformers;
 
 public sealed class PositionalXmlTransformer : IRemapTransformer
 {
     public TransformedDoc Transform(
-        DocumentRecord doc,
-        IReadOnlyList<RemapRuleDto> rulesForThisRemap,
-        bool appendUnmappedToDocDesc
-    )
+        int remapId,
+        IReadOnlyList<RemapRuleDto> rules,
+        bool appendUnmapped,
+        DocumentRecord doc)
     {
-        // Parse existing positional XML into 1-based dictionary
-        var srcVals = ParsePositional(doc.Xml);
+        // 1) Parse source XML
+        var src = Parse(doc.Xml); // dict<int,string?>
 
-        var orderedRules = rulesForThisRemap
-            .OrderBy(r => r.TargetFieldNumber)
-            .ToList();
+        // 2) Identify max target field index (most efficient)
+        int maxT = rules.Max(r => r.MaxTargetFieldIndex);
 
-        var maxField = orderedRules.Count == 0
-            ? 0
-            : orderedRules.Max(r => r.TargetFieldNumber);
+        // 3) Initialize result array (1-based)
+        var tgt = new string?[maxT + 1];
 
-        // 1-based array: index 0 unused
-        var tgtVals = new string?[maxField + 1];
+        // 4) Collect APPEND strings
         var appendParts = new List<string>();
 
-        foreach (var rule in orderedRules)
+        foreach (var r in rules.OrderBy(x => x.TargetFieldNumber))
         {
-            var action = rule.Action?.ToUpperInvariant() ?? "MAP";
-
-            switch (action)
+            switch (r.Action.ToUpperInvariant())
             {
                 case "MAP":
-                {
-                    string value = string.Empty;
-
-                    if (rule.SourceFieldNumber.HasValue &&
-                        srcVals.TryGetValue(rule.SourceFieldNumber.Value, out var srcVal) &&
-                        srcVal is not null)
-                    {
-                        value = srcVal;
-                    }
-                    else if (!string.IsNullOrEmpty(rule.DefaultValue))
-                    {
-                        value = rule.DefaultValue;
-                    }
-
-                    tgtVals[rule.TargetFieldNumber] = value;
+                    if (r.SourceFieldNumber is int sf && src.TryGetValue(sf, out var value))
+                        tgt[r.TargetFieldNumber] = value ?? r.DefaultValue ?? string.Empty;
+                    else
+                        tgt[r.TargetFieldNumber] = r.DefaultValue ?? string.Empty;
                     break;
-                }
 
                 case "DISCARD":
-                {
-                    // DISCARD: target node still exists (empty or default)
-                    tgtVals[rule.TargetFieldNumber] = rule.DefaultValue ?? string.Empty;
+                    tgt[r.TargetFieldNumber] = r.DefaultValue ?? string.Empty;
                     break;
-                }
 
                 case "APPEND":
-                {
-                    // APPEND: XML position still exists (empty/default)
-                    string value = string.Empty;
-
-                    if (rule.SourceFieldNumber.HasValue &&
-                        srcVals.TryGetValue(rule.SourceFieldNumber.Value, out var srcVal) &&
-                        !string.IsNullOrWhiteSpace(srcVal))
+                    if (appendUnmapped &&
+                        r.SourceFieldNumber is int asf &&
+                        src.TryGetValue(asf, out var aval) &&
+                        !string.IsNullOrWhiteSpace(aval))
                     {
-                        value = srcVal.Trim();
-                        if (appendUnmappedToDocDesc)
-                        {
-                            appendParts.Add(value);
-                        }
-                    }
-                    else if (!string.IsNullOrEmpty(rule.DefaultValue))
-                    {
-                        value = rule.DefaultValue;
+                        appendParts.Add(aval!.Trim());
                     }
 
-                    // Even if we append to DocDesc, the node must exist
-                    tgtVals[rule.TargetFieldNumber] = value;
+                    tgt[r.TargetFieldNumber] = r.DefaultValue ?? string.Empty;
                     break;
-                }
-
-                default:
-                {
-                    // Unknown action -> treat as DISCARD with default
-                    tgtVals[rule.TargetFieldNumber] = rule.DefaultValue ?? string.Empty;
-                    break;
-                }
             }
         }
 
-        var newXml = BuildPositional(tgtVals);
-        string? appendNote = null;
+        // 5) Build XML
+        var newXml = BuildPositional(tgt);
 
-        if (appendUnmappedToDocDesc && appendParts.Count > 0)
-        {
-            appendNote = string.Join("; ", appendParts);
-        }
+        // 6) Build note
+        var note = appendParts.Count > 0 ? string.Join("; ", appendParts) : null;
 
-        return new TransformedDoc(
-            doc.RemapId,
-            doc.DocumentKey,
-            newXml,
-            appendNote,
-            "COMPLETED"
-        );
+        return new TransformedDoc(doc.DocumentKey, newXml, note, "COMPLETED");
     }
 
-    private static Dictionary<int, string?> ParsePositional(string xml)
+    private static Dictionary<int, string?> Parse(string xml)
     {
-        var dict = new Dictionary<int, string?>();
-        var xdoc = XDocument.Parse(xml);
+        var map = new Dictionary<int, string?>();
+        var x = XDocument.Parse(xml);
 
-        var root = xdoc.Root;
-        if (root is null) return dict;
-
-        foreach (var el in root.Elements())
+        foreach (var el in x.Root!.Elements())
         {
-            var name = el.Name.LocalName;
-            if (name.StartsWith("Field", StringComparison.OrdinalIgnoreCase) &&
-                int.TryParse(name.Substring("Field".Length), out var idx))
+            if (el.Name.LocalName.StartsWith("Field") &&
+                int.TryParse(el.Name.LocalName.Substring(5), out var n))
             {
-                dict[idx] = (string?)el;
+                map[n] = (string?)el;
             }
         }
-
-        return dict;
+        return map;
     }
 
-    private static string BuildPositional(string?[] tgtVals)
+    private static string BuildPositional(string?[] tgt)
     {
         var root = new XElement("FieldData");
-        for (var i = 1; i < tgtVals.Length; i++)
+
+        for (int i = 1; i < tgt.Length; i++)
         {
-            root.Add(new XElement($"Field{i}", tgtVals[i] ?? string.Empty));
+            root.Add(new XElement($"Field{i}", tgt[i] ?? string.Empty));
         }
 
-        // compact; no indentation to keep payload small
         return new XDocument(root).ToString(SaveOptions.DisableFormatting);
     }
 }
@@ -412,176 +367,36 @@ public sealed class PositionalXmlTransformer : IRemapTransformer
 
 ---
 
-## 8. `GetRulesAsync` implementation (EF/ADO)
+# ⭐ 9. Summary
 
-**`Remap.Infrastructure/Data/SqlRemapRepository_GetRules.cs`**
-(inside your `SqlRemapRepository` class)
+Here is **everything you now have**:
 
-```csharp
-public async Task<IReadOnlyList<RemapRuleDto>> GetRulesAsync(
-    IEnumerable<int> remapIds,
-    CancellationToken ct)
-{
-    var ids = remapIds.Distinct().ToArray();
-    if (ids.Length == 0) return Array.Empty<RemapRuleDto>();
-
-    var rules = await _ef.RemapFields
-        .AsNoTracking()
-        .Where(x => ids.Contains(x.RemapID))
-        .OrderBy(x => x.RemapID)
-        .ThenBy(x => x.TargetFieldNumber)
-        .Select(x => new RemapRuleDto(
-            x.RemapID,
-            x.TargetFieldNumber,
-            x.Action,
-            x.SourceFieldNumber,
-            x.DefaultValue
-        ))
-        .ToListAsync(ct);
-
-    return rules;
-}
-```
+✅ Global batching across mixed RemapIDs
+✅ Per-remap rule sets (TVP_RemapFieldRule)
+✅ Per-remap append flags
+⛔ No SiteCode parameter needed in C#
+🎯 Parallelism uses “shards” → one ApplyBatch each parallel loop
+🔥 Works across multiple Function App instances (idempotent + log table)
 
 ---
 
-## 9. Orchestrator using parallelism (and `RemapOptions`)
+If you want, I can now generate:
 
-**`Remap.Core/Abstractions/IRemapOrchestrator.cs`**
+### ✔ Full RemapRepository.cs
 
-```csharp
-namespace Remap.Core.Abstractions;
+### ✔ Full Orchestrator.cs
 
-public interface IRemapOrchestrator
-{
-    Task<bool> RunOneGlobalCycleAsync(CancellationToken ct);
-}
-```
+### ✔ Full Worker Program.cs
 
-**`Remap.Core/Services/RemapOrchestrator.cs`**
+### ✔ Full Function App Program.cs
 
-```csharp
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-using Remap.Core.Abstractions;
-using Remap.Core.Models;
-using Remap.Core.Options;
+### ✔ Full Test suite (unit + integration)
 
-namespace Remap.Core.Services;
+### ✔ Full SQL rollup script
 
-public sealed class RemapOrchestrator(
-    IRemapRepository repo,
-    IRemapTransformer transformer,
-    IOptions<RemapOptions> options,
-    ILogger<RemapOrchestrator> log
-) : IRemapOrchestrator
-{
-    public async Task<bool> RunOneGlobalCycleAsync(CancellationToken ct)
-    {
-        var cfg = options.Value;
-        var batchSize = cfg.BatchSize;
-        var parallelism = Math.Max(1, cfg.Parallelism);
+Just tell me:
 
-        // 1) Claim a global batch
-        var claim = await repo.ClaimNextGlobalBatchAsync(batchSize, ct);
-        if (claim is null || !claim.HasWork)
-        {
-            log.LogInformation("No work claimed in this cycle.");
-            return false;
-        }
-
-        // 2) Load all rules & flags for all involved remaps
-        var remapIds = claim.DistinctRemapIds;
-        var rules = await repo.GetRulesAsync(remapIds, ct);
-        var appendFlags = await repo.GetAppendFlagsAsync(remapIds, ct);
-
-        // 3) Load full document XML for claimed docs
-        var docs = await repo.GetDocumentsAsync(claim.Documents, ct);
-        if (docs.Count == 0)
-        {
-            log.LogWarning("Claimed docs but found none in DB.");
-            return false;
-        }
-
-        // 4) Partition docs into N shards for parallel processing
-        var docsArray = docs.ToArray();
-        var total = docsArray.Length;
-        var shardCount = Math.Min(parallelism, total);
-        var shardSize = (int)Math.Ceiling(total / (double)shardCount);
-
-        var shardTasks = new List<Task>(shardCount);
-
-        for (var shardIndex = 0; shardIndex < shardCount; shardIndex++)
-        {
-            var start = shardIndex * shardSize;
-            var end = Math.Min(start + shardSize, total);
-            if (start >= end) break;
-
-            var segment = docsArray[start..end];
-
-            shardTasks.Add(Task.Run(async () =>
-            {
-                var shardResults = new List<TransformedDoc>(segment.Length);
-
-                foreach (var d in segment)
-                {
-                    try
-                    {
-                        var rulesForRemap = rules
-                            .Where(r => r.RemapId == d.RemapId)
-                            .ToList();
-
-                        appendFlags.TryGetValue(d.RemapId, out var appendFlag);
-
-                        var result = transformer.Transform(
-                            d,
-                            rulesForRemap,
-                            appendFlag
-                        );
-
-                        shardResults.Add(result);
-                    }
-                    catch (Exception ex)
-                    {
-                        log.LogError(ex, "Transform failed for doc {DocKey}", d.DocumentKey);
-                        shardResults.Add(new TransformedDoc(
-                            d.RemapId,
-                            d.DocumentKey,
-                            d.Xml,
-                            null,
-                            "ERROR"));
-                    }
-                }
-
-                if (shardResults.Count > 0)
-                {
-                    await repo.ApplyBatchAsync(shardResults, ct);
-                }
-            }, ct));
-        }
-
-        await Task.WhenAll(shardTasks);
-        return true;
-    }
-}
-```
-
-* **Parallelism:** We claim one global batch (up to `BatchSize` docs), then split that into `Parallelism` shards.
-* **DB calls:**
-
-  * 1x `ClaimNextGlobalBatchAsync`
-  * 1x `GetRulesAsync`
-  * 1x `GetAppendFlagsAsync`
-  * 1x `GetDocumentsAsync`
-  * 1x `ApplyBatchAsync` **per shard** (so, for 1000 docs and `Parallelism=4`, up to 4 ApplyBatch calls, as you wanted).
-
----
-
-If you paste these into the appropriate projects:
-
-* `Remap.Core`: models, abstractions, options, orchestrator.
-* `Remap.Infrastructure`: transformer + repository implementation for `GetRulesAsync`, `GetAppendFlagsAsync`, etc.
-
-your build should succeed and the **parallel global-cycle** behavior will match our latest design.
-
-If you send me your **current `ClaimedWorkItem` and `SqlRemapRepository`** signatures, I can tighten this even further to *exactly* match what you have – but the above is self-consistent and ready to drop in.
+**“Give me everything”** or
+**“Give me Repository”** or
+**“Give me Orchestrator”** or
+**“Give me Tests”**.
