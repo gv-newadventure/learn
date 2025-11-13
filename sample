@@ -1,165 +1,561 @@
-Good call — doing **Option A + fixing the DbContext lifetime** is exactly what I’d do for a worker.
-
-I’ll break this into **two concrete changes**:
+Great, let’s straighten this out so everything lines up and compiles cleanly. I’ll tackle your questions one by one and then give you the concrete code you’re missing: **`RemapRuleDto`**, **`IRemapTransformer`**, **`GetRulesAsync`** (interface + implementation), and the **updated orchestrator** using parallelism and `RemapOptions`.
 
 ---
 
-## 1. DbContext as transient (and used via scopes)
+## 1. Where do Core files go?
 
-In **Remap.Worker Program.cs** (or wherever you configure DI), register the DbContext like this:
+You asked earlier:
+
+> under which project I need to add the files under this section 3) Core — models, interfaces, services
+
+All of these belong in the **`Remap.Core`** project:
+
+* `Remap.Core/Models/…`
+* `Remap.Core/Abstractions/…`
+* `Remap.Core/Services/…`
+* `Remap.Core/Options/RemapOptions.cs`
+
+Infrastructure / Worker / Functions reference this project.
+
+---
+
+## 2. Why is `RemapOptions` “not used”?
+
+Originally we only used `BatchSize`, so `Parallelism` was just sitting there.
+Now we’ll **actually use both** in the orchestrator:
+
+* `BatchSize` → how many docs to claim per global cycle.
+* `Parallelism` → into how many **shards** we split the batch to process in parallel.
+
+So yes, after the update below, `RemapOptions` is truly used.
+
+---
+
+## 3. Should you change DbContext/DI in Functions too?
+
+> why only worker program.cs was changed? the function app is not affeced? should we include the same change in the function app's program.cs file?
+
+Yes, the **same pattern** should apply to **Functions** as to **Worker**:
+
+* Use `AddDbContext<RemapDbContext>(…, ServiceLifetime.Transient, ServiceLifetime.Transient)`
+  so each operation gets a fresh context and you avoid lifetime conflicts under parallelism.
+
+---
+
+## 4. Should `IRemapTransformer` be transient?
+
+> Should I add Transient for IRemapTransformer as well?
+
+You **don’t need to**:
+
+* `PositionalXmlTransformer` is **stateless** and **thread-safe**.
+* Singleton is fine and efficient.
+
+If you prefer consistency, you *can* register it as `Transient`, but it’s not required.
+
+---
+
+## 5. `RunOneGlobalCycleAsync` return type
+
+> Also the RunOneGlobalCycleAsync method returns void but your code returns didwork
+
+The pattern I’m using is:
 
 ```csharp
-var builder = Host.CreateDefaultBuilder(args)
-    .ConfigureServices((ctx, services) =>
-    {
-        var configuration = ctx.Configuration;
-
-        services.AddDbContext<RemapDbContext>(
-            options =>
-                options.UseSqlServer(
-                    configuration.GetConnectionString("MainConnectionString")),
-            contextLifetime: ServiceLifetime.Transient,
-            optionsLifetime: ServiceLifetime.Transient);
-
-        // Repo + orchestrator **not** singletons
-        services.AddTransient<IRemapRepository, SqlRemapRepository>();
-        services.AddTransient<IRemapOrchestrator, RemapOrchestrator>();
-
-        // Worker uses scopes for each cycle
-        services.AddHostedService<RemapWorkerService>();
-    });
+Task<bool> RunOneGlobalCycleAsync(CancellationToken ct)
 ```
 
-And in **RemapWorkerService** use an `IServiceScopeFactory` so each cycle gets a fresh DbContext:
+* `true`  → this cycle processed at least 1 document.
+* `false` → nothing to do (no claimed batch).
+
+If you currently have `Task RunOneGlobalCycleAsync`, you can either:
+
+* **Change the signature** to `Task<bool>` and use the bool in your loop, or
+* Ignore the bool at call site:
 
 ```csharp
-public class RemapWorkerService : BackgroundService
+_ = await orchestrator.RunOneGlobalCycleAsync(ct);
+```
+
+I recommend **changing the signature** to `Task<bool>` – it’s useful for deciding whether to delay in the polling loop.
+
+---
+
+## 6. `RemapRuleDto` and `GetRulesAsync` — full definitions
+
+You’re right: I referenced `RemapRuleDto` without giving you its code, and I also changed `GetRulesAsync` to return a collection. Here’s the **complete, consistent version**.
+
+### 6.1 Core models
+
+**`Remap.Core/Models/RemapRuleDto.cs`**
+
+```csharp
+namespace Remap.Core.Models;
+
+public sealed record RemapRuleDto(
+    int RemapId,
+    int TargetFieldNumber,
+    string Action,          // "MAP" | "DISCARD" | "APPEND"
+    int? SourceFieldNumber,
+    string? DefaultValue
+);
+```
+
+**`Remap.Core/Models/ClaimedWorkItem.cs`**
+(assuming your global-claim SP returns multiple docs across RemapIds)
+
+```csharp
+namespace Remap.Core.Models;
+
+public sealed record ClaimedDoc(
+    int RemapId,
+    Guid DocumentKey
+);
+
+public sealed record ClaimedWorkItem(
+    IReadOnlyList<ClaimedDoc> Documents
+)
 {
-    private readonly IServiceScopeFactory _scopeFactory;
-    private readonly ILogger<RemapWorkerService> _logger;
-    private readonly RemapOptions _options;
+    public bool HasWork => Documents.Count > 0;
 
-    public RemapWorkerService(
-        IServiceScopeFactory scopeFactory,
-        IOptions<RemapOptions> options,
-        ILogger<RemapWorkerService> logger)
+    public IReadOnlyList<int> DistinctRemapIds =>
+        Documents.Select(d => d.RemapId).Distinct().ToList();
+}
+```
+
+**`Remap.Core/Models/DocumentRecord.cs`**
+
+```csharp
+namespace Remap.Core.Models;
+
+public sealed record DocumentRecord(
+    int RemapId,
+    Guid DocumentKey,
+    string Xml,
+    string? DocDesc
+);
+```
+
+**`Remap.Core/Models/TransformedDoc.cs`**
+
+```csharp
+namespace Remap.Core.Models;
+
+public sealed record TransformedDoc(
+    int RemapId,
+    Guid DocumentKey,
+    string NewXml,
+    string? AppendNote,
+    string Status   // "COMPLETED" or "ERROR"
+);
+```
+
+**`Remap.Core/Options/RemapOptions.cs`**
+
+```csharp
+namespace Remap.Core.Options;
+
+public sealed class RemapOptions
+{
+    public int BatchSize { get; set; } = 1000;
+    public int Parallelism { get; set; } = 4;
+}
+```
+
+---
+
+### 6.2 `IRemapTransformer` interface
+
+**`Remap.Core/Abstractions/IRemapTransformer.cs`**
+
+```csharp
+using Remap.Core.Models;
+
+namespace Remap.Core.Abstractions;
+
+public interface IRemapTransformer
+{
+    TransformedDoc Transform(
+        DocumentRecord doc,
+        IReadOnlyList<RemapRuleDto> rulesForThisRemap,
+        bool appendUnmappedToDocDesc
+    );
+}
+```
+
+* We pass the **document**, the **rules for that RemapId**, and a flag indicating if we should append.
+* The transformer returns a **TransformedDoc** ready to go into TVP.
+
+---
+
+### 6.3 `IRemapRepository` updated
+
+**`Remap.Core/Abstractions/IRemapRepository.cs`**
+
+```csharp
+using Remap.Core.Models;
+
+namespace Remap.Core.Abstractions;
+
+public interface IRemapRepository
+{
+    // Claims a single global batch across remaps (from your usp_Remap_ClaimNextGlobalBatch)
+    Task<ClaimedWorkItem?> ClaimNextGlobalBatchAsync(int batchSize, CancellationToken ct);
+
+    // Loads rules for all remaps involved in this batch
+    Task<IReadOnlyList<RemapRuleDto>> GetRulesAsync(
+        IEnumerable<int> remapIds,
+        CancellationToken ct
+    );
+
+    // Loads documents given (RemapId, DocumentKey)
+    Task<IReadOnlyList<DocumentRecord>> GetDocumentsAsync(
+        IEnumerable<ClaimedDoc> docs,
+        CancellationToken ct
+    );
+
+    // Applies a subset (shard) of transformed docs
+    Task ApplyBatchAsync(
+        IReadOnlyList<TransformedDoc> results,
+        CancellationToken ct
+    );
+
+    // Reads AppendUnmappedCategories flag for given remapIds
+    Task<IDictionary<int, bool>> GetAppendFlagsAsync(
+        IEnumerable<int> remapIds,
+        CancellationToken ct
+    );
+}
+```
+
+> If you don’t have `GetAppendFlagsAsync` yet, you can fold that logic into `GetRulesAsync` or pull it from the master table in `SqlRemapRepository`.
+
+---
+
+## 7. Positional transformer – full implementation
+
+**`Remap.Infrastructure/Xml/PositionalXmlTransformer.cs`**
+
+```csharp
+using System.Xml.Linq;
+using Remap.Core.Abstractions;
+using Remap.Core.Models;
+
+namespace Remap.Infrastructure.Xml;
+
+public sealed class PositionalXmlTransformer : IRemapTransformer
+{
+    public TransformedDoc Transform(
+        DocumentRecord doc,
+        IReadOnlyList<RemapRuleDto> rulesForThisRemap,
+        bool appendUnmappedToDocDesc
+    )
     {
-        _scopeFactory = scopeFactory;
-        _logger = logger;
-        _options = options.Value;
-    }
+        // Parse existing positional XML into 1-based dictionary
+        var srcVals = ParsePositional(doc.Xml);
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        _logger.LogInformation("RemapWorker starting with BatchSize={Batch}, Parallelism={Par}",
-            _options.BatchSize, _options.Parallelism);
+        var orderedRules = rulesForThisRemap
+            .OrderBy(r => r.TargetFieldNumber)
+            .ToList();
 
-        while (!stoppingToken.IsCancellationRequested)
+        var maxField = orderedRules.Count == 0
+            ? 0
+            : orderedRules.Max(r => r.TargetFieldNumber);
+
+        // 1-based array: index 0 unused
+        var tgtVals = new string?[maxField + 1];
+        var appendParts = new List<string>();
+
+        foreach (var rule in orderedRules)
         {
-            try
+            var action = rule.Action?.ToUpperInvariant() ?? "MAP";
+
+            switch (action)
             {
-                using (var scope = _scopeFactory.CreateScope())
+                case "MAP":
                 {
-                    var orchestrator = scope.ServiceProvider.GetRequiredService<IRemapOrchestrator>();
+                    string value = string.Empty;
 
-                    var didWork = await orchestrator.RunOneGlobalCycleAsync(
-                        _options.BatchSize,
-                        _options.Parallelism,
-                        stoppingToken);
-
-                    if (!didWork)
+                    if (rule.SourceFieldNumber.HasValue &&
+                        srcVals.TryGetValue(rule.SourceFieldNumber.Value, out var srcVal) &&
+                        srcVal is not null)
                     {
-                        // No work claimed – back off a bit
-                        await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+                        value = srcVal;
                     }
+                    else if (!string.IsNullOrEmpty(rule.DefaultValue))
+                    {
+                        value = rule.DefaultValue;
+                    }
+
+                    tgtVals[rule.TargetFieldNumber] = value;
+                    break;
+                }
+
+                case "DISCARD":
+                {
+                    // DISCARD: target node still exists (empty or default)
+                    tgtVals[rule.TargetFieldNumber] = rule.DefaultValue ?? string.Empty;
+                    break;
+                }
+
+                case "APPEND":
+                {
+                    // APPEND: XML position still exists (empty/default)
+                    string value = string.Empty;
+
+                    if (rule.SourceFieldNumber.HasValue &&
+                        srcVals.TryGetValue(rule.SourceFieldNumber.Value, out var srcVal) &&
+                        !string.IsNullOrWhiteSpace(srcVal))
+                    {
+                        value = srcVal.Trim();
+                        if (appendUnmappedToDocDesc)
+                        {
+                            appendParts.Add(value);
+                        }
+                    }
+                    else if (!string.IsNullOrEmpty(rule.DefaultValue))
+                    {
+                        value = rule.DefaultValue;
+                    }
+
+                    // Even if we append to DocDesc, the node must exist
+                    tgtVals[rule.TargetFieldNumber] = value;
+                    break;
+                }
+
+                default:
+                {
+                    // Unknown action -> treat as DISCARD with default
+                    tgtVals[rule.TargetFieldNumber] = rule.DefaultValue ?? string.Empty;
+                    break;
                 }
             }
-            catch (Exception ex)
+        }
+
+        var newXml = BuildPositional(tgtVals);
+        string? appendNote = null;
+
+        if (appendUnmappedToDocDesc && appendParts.Count > 0)
+        {
+            appendNote = string.Join("; ", appendParts);
+        }
+
+        return new TransformedDoc(
+            doc.RemapId,
+            doc.DocumentKey,
+            newXml,
+            appendNote,
+            "COMPLETED"
+        );
+    }
+
+    private static Dictionary<int, string?> ParsePositional(string xml)
+    {
+        var dict = new Dictionary<int, string?>();
+        var xdoc = XDocument.Parse(xml);
+
+        var root = xdoc.Root;
+        if (root is null) return dict;
+
+        foreach (var el in root.Elements())
+        {
+            var name = el.Name.LocalName;
+            if (name.StartsWith("Field", StringComparison.OrdinalIgnoreCase) &&
+                int.TryParse(name.Substring("Field".Length), out var idx))
             {
-                _logger.LogError(ex, "Unexpected error in RemapWorker cycle");
-                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                dict[idx] = (string?)el;
             }
         }
+
+        return dict;
+    }
+
+    private static string BuildPositional(string?[] tgtVals)
+    {
+        var root = new XElement("FieldData");
+        for (var i = 1; i < tgtVals.Length; i++)
+        {
+            root.Add(new XElement($"Field{i}", tgtVals[i] ?? string.Empty));
+        }
+
+        // compact; no indentation to keep payload small
+        return new XDocument(root).ToString(SaveOptions.DisableFormatting);
     }
 }
 ```
 
-With this pattern:
-
-* Each cycle → new scope → new `SqlRemapRepository` → new **transient** `RemapDbContext`.
-* No DbContext instance is ever used across cycles or threads.
-* You still get all the benefits of EF tracking / change detection per scope.
-
 ---
 
-## 2. Apply **Option A** – materialize rules before parallel work
+## 8. `GetRulesAsync` implementation (EF/ADO)
 
-The exception you saw (`A second operation was started on this context instance before a previous operation completed`) was because one `RemapDbContext` query was being used while another operation on the same context was still in-flight.
-
-Option A is: **materialize the EF query into a list before you go parallel**.
-
-In `SqlRemapRepository` (or wherever `GetRulesAsync` lives), change it like this:
+**`Remap.Infrastructure/Data/SqlRemapRepository_GetRules.cs`**
+(inside your `SqlRemapRepository` class)
 
 ```csharp
 public async Task<IReadOnlyList<RemapRuleDto>> GetRulesAsync(
     IEnumerable<int> remapIds,
     CancellationToken ct)
 {
-    var ids = remapIds.Distinct().ToList();
-    if (ids.Count == 0)
-        return Array.Empty<RemapRuleDto>();
+    var ids = remapIds.Distinct().ToArray();
+    if (ids.Length == 0) return Array.Empty<RemapRuleDto>();
 
-    // 1. Execute the EF query once, fully, on this DbContext
-    var entities = await _db.RemapRules
-        .Where(r => ids.Contains(r.RemapId))
+    var rules = await _ef.RemapFields
         .AsNoTracking()
-        .ToListAsync(ct);   // <-- finished DB work here
+        .Where(x => ids.Contains(x.RemapID))
+        .OrderBy(x => x.RemapID)
+        .ThenBy(x => x.TargetFieldNumber)
+        .Select(x => new RemapRuleDto(
+            x.RemapID,
+            x.TargetFieldNumber,
+            x.Action,
+            x.SourceFieldNumber,
+            x.DefaultValue
+        ))
+        .ToListAsync(ct);
 
-    // 2. From here on, we are in-memory – safe to use in parallel
-    return entities
-        .Select(e => new RemapRuleDto
-        {
-            RemapId = e.RemapId,
-            SiteCode = e.SiteCode,
-            SourceCategoryKey = e.SourceCategoryKey,
-            TargetCategoryKey = e.TargetCategoryKey,
-            AppendUnmappedCategories = e.AppendUnmappedCategories
-        })
-        .ToList();
+    return rules;
 }
 ```
 
-Anywhere you previously did something like:
+---
+
+## 9. Orchestrator using parallelism (and `RemapOptions`)
+
+**`Remap.Core/Abstractions/IRemapOrchestrator.cs`**
 
 ```csharp
-var rulesQuery = _repo.GetRulesQueryable(remapIds);
-// and then iterated that query from multiple tasks / shards
+namespace Remap.Core.Abstractions;
+
+public interface IRemapOrchestrator
+{
+    Task<bool> RunOneGlobalCycleAsync(CancellationToken ct);
+}
 ```
 
-change it to:
+**`Remap.Core/Services/RemapOrchestrator.cs`**
 
 ```csharp
-var rules = await _repo.GetRulesAsync(remapIds, ct);  // materialized list
-// rules is now just an in-memory List<T>
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Remap.Core.Abstractions;
+using Remap.Core.Models;
+using Remap.Core.Options;
+
+namespace Remap.Core.Services;
+
+public sealed class RemapOrchestrator(
+    IRemapRepository repo,
+    IRemapTransformer transformer,
+    IOptions<RemapOptions> options,
+    ILogger<RemapOrchestrator> log
+) : IRemapOrchestrator
+{
+    public async Task<bool> RunOneGlobalCycleAsync(CancellationToken ct)
+    {
+        var cfg = options.Value;
+        var batchSize = cfg.BatchSize;
+        var parallelism = Math.Max(1, cfg.Parallelism);
+
+        // 1) Claim a global batch
+        var claim = await repo.ClaimNextGlobalBatchAsync(batchSize, ct);
+        if (claim is null || !claim.HasWork)
+        {
+            log.LogInformation("No work claimed in this cycle.");
+            return false;
+        }
+
+        // 2) Load all rules & flags for all involved remaps
+        var remapIds = claim.DistinctRemapIds;
+        var rules = await repo.GetRulesAsync(remapIds, ct);
+        var appendFlags = await repo.GetAppendFlagsAsync(remapIds, ct);
+
+        // 3) Load full document XML for claimed docs
+        var docs = await repo.GetDocumentsAsync(claim.Documents, ct);
+        if (docs.Count == 0)
+        {
+            log.LogWarning("Claimed docs but found none in DB.");
+            return false;
+        }
+
+        // 4) Partition docs into N shards for parallel processing
+        var docsArray = docs.ToArray();
+        var total = docsArray.Length;
+        var shardCount = Math.Min(parallelism, total);
+        var shardSize = (int)Math.Ceiling(total / (double)shardCount);
+
+        var shardTasks = new List<Task>(shardCount);
+
+        for (var shardIndex = 0; shardIndex < shardCount; shardIndex++)
+        {
+            var start = shardIndex * shardSize;
+            var end = Math.Min(start + shardSize, total);
+            if (start >= end) break;
+
+            var segment = docsArray[start..end];
+
+            shardTasks.Add(Task.Run(async () =>
+            {
+                var shardResults = new List<TransformedDoc>(segment.Length);
+
+                foreach (var d in segment)
+                {
+                    try
+                    {
+                        var rulesForRemap = rules
+                            .Where(r => r.RemapId == d.RemapId)
+                            .ToList();
+
+                        appendFlags.TryGetValue(d.RemapId, out var appendFlag);
+
+                        var result = transformer.Transform(
+                            d,
+                            rulesForRemap,
+                            appendFlag
+                        );
+
+                        shardResults.Add(result);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.LogError(ex, "Transform failed for doc {DocKey}", d.DocumentKey);
+                        shardResults.Add(new TransformedDoc(
+                            d.RemapId,
+                            d.DocumentKey,
+                            d.Xml,
+                            null,
+                            "ERROR"));
+                    }
+                }
+
+                if (shardResults.Count > 0)
+                {
+                    await repo.ApplyBatchAsync(shardResults, ct);
+                }
+            }, ct));
+        }
+
+        await Task.WhenAll(shardTasks);
+        return true;
+    }
+}
 ```
 
-Then in your orchestrator, when you go parallel (e.g. `Parallel.ForEachAsync` or multiple tasks), you pass those **in-memory** rules, not the EF query.
+* **Parallelism:** We claim one global batch (up to `BatchSize` docs), then split that into `Parallelism` shards.
+* **DB calls:**
+
+  * 1x `ClaimNextGlobalBatchAsync`
+  * 1x `GetRulesAsync`
+  * 1x `GetAppendFlagsAsync`
+  * 1x `GetDocumentsAsync`
+  * 1x `ApplyBatchAsync` **per shard** (so, for 1000 docs and `Parallelism=4`, up to 4 ApplyBatch calls, as you wanted).
 
 ---
 
-### Why this combo fixes you now *and* protects you later
+If you paste these into the appropriate projects:
 
-* **Transient DbContext + scoped usage** means:
+* `Remap.Core`: models, abstractions, options, orchestrator.
+* `Remap.Infrastructure`: transformer + repository implementation for `GetRulesAsync`, `GetAppendFlagsAsync`, etc.
 
-  * Each time you ask DI for `RemapDbContext` within a scope, you get a fresh instance.
-  * When the scope ends, the context is disposed.
-* **Materializing queries before parallelism** ensures that:
+your build should succeed and the **parallel global-cycle** behavior will match our latest design.
 
-  * EF Core is only doing one operation at a time on a given context.
-  * All parallel work is over plain C# objects, not EF queries.
-
-So your current error goes away, and future concurrency changes are much less likely to blow up with that same “second operation” exception.
-
----
-
-If you paste your current `Program.cs` and `RemapWorkerService` code next time, I can inline the exact edits against your version — but with these snippets you should be able to update things immediately and run again.
+If you send me your **current `ClaimedWorkItem` and `SqlRemapRepository`** signatures, I can tighten this even further to *exactly* match what you have – but the above is self-consistent and ready to drop in.
