@@ -1,43 +1,165 @@
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Remap.Core.Abstractions;
-using Remap.Core.Services;
-using Remap.Infrastructure.Configuration;
-using Remap.Infrastructure.Data;
-using Serilog;
+Good call — doing **Option A + fixing the DbContext lifetime** is exactly what I’d do for a worker.
 
-var builder = Host.CreateApplicationBuilder(args);
+I’ll break this into **two concrete changes**:
 
-// --- Options ---
-builder.Services.Configure<InfrastructureOptions>(
-    builder.Configuration.GetSection("Infrastructure"));
-builder.Services.Configure<RemapOptions>(
-    builder.Configuration.GetSection("Remap"));
+---
 
-// --- EF Core DbContext ---
-builder.Services.AddDbContext<RemapDbContext>(options =>
-    options.UseSqlServer(
-        builder.Configuration.GetSection("Infrastructure")["MainConnectionString"])
-);
+## 1. DbContext as transient (and used via scopes)
 
-// --- DI registrations (SCOPED, not singleton!) ---
-builder.Services.AddScoped<IRemapRepository, SqlRemapRepository>();
-builder.Services.AddScoped<IRemapTransformer, PositionalXmlTransformer>();
-builder.Services.AddScoped<IRemapOrchestrator, RemapOrchestrator>();
+In **Remap.Worker Program.cs** (or wherever you configure DI), register the DbContext like this:
 
-// Hosted worker
-builder.Services.AddHostedService<RemapWorker>();
+```csharp
+var builder = Host.CreateDefaultBuilder(args)
+    .ConfigureServices((ctx, services) =>
+    {
+        var configuration = ctx.Configuration;
 
-// --- Serilog basic console logger (no ReadFrom.Configuration) ---
-Log.Logger = new LoggerConfiguration()
-    .MinimumLevel.Information()
-    .Enrich.FromLogContext()
-    .WriteTo.Console()
-    .CreateLogger();
+        services.AddDbContext<RemapDbContext>(
+            options =>
+                options.UseSqlServer(
+                    configuration.GetConnectionString("MainConnectionString")),
+            contextLifetime: ServiceLifetime.Transient,
+            optionsLifetime: ServiceLifetime.Transient);
 
-builder.Logging.ClearProviders();
-builder.Logging.AddSerilog(Log.Logger, dispose: true);
+        // Repo + orchestrator **not** singletons
+        services.AddTransient<IRemapRepository, SqlRemapRepository>();
+        services.AddTransient<IRemapOrchestrator, RemapOrchestrator>();
 
-var host = builder.Build();
-await host.RunAsync();
+        // Worker uses scopes for each cycle
+        services.AddHostedService<RemapWorkerService>();
+    });
+```
+
+And in **RemapWorkerService** use an `IServiceScopeFactory` so each cycle gets a fresh DbContext:
+
+```csharp
+public class RemapWorkerService : BackgroundService
+{
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<RemapWorkerService> _logger;
+    private readonly RemapOptions _options;
+
+    public RemapWorkerService(
+        IServiceScopeFactory scopeFactory,
+        IOptions<RemapOptions> options,
+        ILogger<RemapWorkerService> logger)
+    {
+        _scopeFactory = scopeFactory;
+        _logger = logger;
+        _options = options.Value;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("RemapWorker starting with BatchSize={Batch}, Parallelism={Par}",
+            _options.BatchSize, _options.Parallelism);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                using (var scope = _scopeFactory.CreateScope())
+                {
+                    var orchestrator = scope.ServiceProvider.GetRequiredService<IRemapOrchestrator>();
+
+                    var didWork = await orchestrator.RunOneGlobalCycleAsync(
+                        _options.BatchSize,
+                        _options.Parallelism,
+                        stoppingToken);
+
+                    if (!didWork)
+                    {
+                        // No work claimed – back off a bit
+                        await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error in RemapWorker cycle");
+                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+            }
+        }
+    }
+}
+```
+
+With this pattern:
+
+* Each cycle → new scope → new `SqlRemapRepository` → new **transient** `RemapDbContext`.
+* No DbContext instance is ever used across cycles or threads.
+* You still get all the benefits of EF tracking / change detection per scope.
+
+---
+
+## 2. Apply **Option A** – materialize rules before parallel work
+
+The exception you saw (`A second operation was started on this context instance before a previous operation completed`) was because one `RemapDbContext` query was being used while another operation on the same context was still in-flight.
+
+Option A is: **materialize the EF query into a list before you go parallel**.
+
+In `SqlRemapRepository` (or wherever `GetRulesAsync` lives), change it like this:
+
+```csharp
+public async Task<IReadOnlyList<RemapRuleDto>> GetRulesAsync(
+    IEnumerable<int> remapIds,
+    CancellationToken ct)
+{
+    var ids = remapIds.Distinct().ToList();
+    if (ids.Count == 0)
+        return Array.Empty<RemapRuleDto>();
+
+    // 1. Execute the EF query once, fully, on this DbContext
+    var entities = await _db.RemapRules
+        .Where(r => ids.Contains(r.RemapId))
+        .AsNoTracking()
+        .ToListAsync(ct);   // <-- finished DB work here
+
+    // 2. From here on, we are in-memory – safe to use in parallel
+    return entities
+        .Select(e => new RemapRuleDto
+        {
+            RemapId = e.RemapId,
+            SiteCode = e.SiteCode,
+            SourceCategoryKey = e.SourceCategoryKey,
+            TargetCategoryKey = e.TargetCategoryKey,
+            AppendUnmappedCategories = e.AppendUnmappedCategories
+        })
+        .ToList();
+}
+```
+
+Anywhere you previously did something like:
+
+```csharp
+var rulesQuery = _repo.GetRulesQueryable(remapIds);
+// and then iterated that query from multiple tasks / shards
+```
+
+change it to:
+
+```csharp
+var rules = await _repo.GetRulesAsync(remapIds, ct);  // materialized list
+// rules is now just an in-memory List<T>
+```
+
+Then in your orchestrator, when you go parallel (e.g. `Parallel.ForEachAsync` or multiple tasks), you pass those **in-memory** rules, not the EF query.
+
+---
+
+### Why this combo fixes you now *and* protects you later
+
+* **Transient DbContext + scoped usage** means:
+
+  * Each time you ask DI for `RemapDbContext` within a scope, you get a fresh instance.
+  * When the scope ends, the context is disposed.
+* **Materializing queries before parallelism** ensures that:
+
+  * EF Core is only doing one operation at a time on a given context.
+  * All parallel work is over plain C# objects, not EF queries.
+
+So your current error goes away, and future concurrency changes are much less likely to blow up with that same “second operation” exception.
+
+---
+
+If you paste your current `Program.cs` and `RemapWorkerService` code next time, I can inline the exact edits against your version — but with these snippets you should be able to update things immediately and run again.
