@@ -1,3 +1,29 @@
+public async Task<IReadOnlyList<RemapRuleDto>> GetRulesAsync(
+    IEnumerable<int> remapIds,
+    CancellationToken ct)
+{
+    var ids = remapIds.Distinct().ToArray();
+    if (ids.Length == 0) return Array.Empty<RemapRuleDto>();
+
+    var rules = await _ef.RemapFields
+        .AsNoTracking()
+        .Where(x => ids.Contains(x.RemapID))
+        .OrderBy(x => x.RemapID)
+        .ThenBy(x => x.TargetFieldNumber)
+        .Select(x => new RemapRuleDto(
+            x.RemapID,
+            x.TargetFieldNumber,
+            x.Action,
+            x.SourceFieldNumber,
+            x.DefaultValue
+        ))
+        .ToListAsync(ct);
+
+    return rules;
+}
+----------------------
+
+
 Great, let’s straighten this out so everything lines up and compiles cleanly. I’ll tackle your questions one by one and then give you the concrete code you’re missing: **`RemapRuleDto`**, **`IRemapTransformer`**, **`GetRulesAsync`** (interface + implementation), and the **updated orchestrator** using parallelism and `RemapOptions`.
 
 ---
