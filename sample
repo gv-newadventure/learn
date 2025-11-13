@@ -1,94 +1,12 @@
-using System;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Remap.Core;
-using Remap.Core.Abstractions;
-using Remap.Infrastructure;
-using Remap.Infrastructure.Data;
-using Remap.Infrastructure.Sql;
-using Serilog;
-using Serilog.Events;
-
-internal class Program
 {
-    public static void Main(string[] args)
-    {
-        // Build configuration first
-        var config = new ConfigurationBuilder()
-            .SetBasePath(AppContext.BaseDirectory)
-            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-            .AddEnvironmentVariables()
-            .Build();
-
-        // Basic Serilog (no ReadFrom.Configuration needed)
-        Log.Logger = new LoggerConfiguration()
-            .MinimumLevel.Debug()
-            .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
-            .Enrich.FromLogContext()
-            .WriteTo.Console()
-            .CreateLogger();
-
-        try
-        {
-            Log.Information("Starting RemapWorker");
-
-            var host = Host.CreateDefaultBuilder(args)
-                .UseSerilog() // use the logger we just created
-                .ConfigureAppConfiguration(builder =>
-                {
-                    builder.Sources.Clear();
-                    builder.AddConfiguration(config);
-                })
-                .ConfigureServices((ctx, services) =>
-                {
-                    // Bind options
-                    services.Configure<RemapOptions>(ctx.Configuration.GetSection("Remap"));
-                    services.Configure<InfrastructureOptions>(ctx.Configuration.GetSection("Infrastructure"));
-
-                    // DbContext: TRANSIENT as you requested
-                    services.AddDbContext<RemapDbContext>((sp, options) =>
-                    {
-                        var infra = sp
-                            .GetRequiredService<Microsoft.Extensions.Options.IOptions<InfrastructureOptions>>()
-                            .Value;
-
-                        if (string.IsNullOrWhiteSpace(infra.MainConnectionString))
-                        {
-                            throw new InvalidOperationException("Infrastructure:MainConnectionString is missing.");
-                        }
-
-                        options.UseSqlServer(
-                            infra.MainConnectionString,
-                            sql =>
-                            {
-                                sql.CommandTimeout(infra.CommandTimeoutSeconds);
-                            });
-                    }, ServiceLifetime.Transient);
-
-                    // Repository + transformer
-                    services.AddTransient<IRemapRepository, SqlRemapRepository>();
-                    services.AddTransient<IRemapTransformer, PositionalXmlTransformer>();
-
-                    // Orchestrator
-                    services.AddTransient<IRemapOrchestrator, RemapOrchestrator>();
-
-                    // Background worker
-                    services.AddHostedService<RemapWorkerService>();
-                })
-                .Build();
-
-            host.Run();
-        }
-        catch (Exception ex)
-        {
-            Log.Fatal(ex, "Host terminated unexpectedly");
-        }
-        finally
-        {
-            Log.CloseAndFlush();
-        }
+  "$schema": "https://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "Remap.Worker": {
+      "commandName": "Project",
+      "dotnetRunMessages": true,
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Development"
+      }
     }
+  }
 }
