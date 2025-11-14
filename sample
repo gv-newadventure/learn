@@ -1,165 +1,25 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using Remap.Core.Abstractions;
-using Remap.Core.Models;
-using Remap.Core.Options;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
+Got it — thank you for the clarification.
+Here’s the corrected email from your perspective as a CNB contractor, asking your CNB hiring manager (not Procom) for the bill rate CNB pays Procom, so you can negotiate Procom’s cut — without discussing your own pay at all.
 
-namespace Remap.Core
-{
-    public sealed class RemapOrchestrator : IRemapOrchestrator
-    {
-        private readonly IRemapRepository _repo;
-        private readonly IRemapTransformer _transformer;
-        private readonly ILogger<RemapOrchestrator> _log;
-        private readonly IOptions<RemapOptions> _options;
-        private readonly int _fallbackParallelism;
 
-        public RemapOrchestrator(
-            IRemapRepository repo,
-            IRemapTransformer transformer,
-            IOptions<RemapOptions> options,
-            ILogger<RemapOrchestrator> log,
-            int parallelism = 4) // fallback only
-        {
-            _repo = repo;
-            _transformer = transformer;
-            _log = log;
-            _options = options;
-            _fallbackParallelism = Math.Max(1, parallelism);
-        }
+---
 
-        public async Task<bool> RunOneGlobalCycleAsync(CancellationToken ct)
-        {
-            var cfg = _options.Value;
+Subject: Thank You & Quick Clarification
 
-            int batchSize = cfg.BatchSize;
-            int parallelism = cfg.Parallelism > 0 ? cfg.Parallelism : _fallbackParallelism;
+Hi [Manager’s Name],
 
-            // ⚡ 1) Claim a global batch
-            var claim = await _repo.ClaimNextGlobalBatchAsync(batchSize, ct);
-            if (claim == null || !claim.HasWork)
-            {
-                _log.LogInformation("No work claimed in this cycle.");
-                return false;
-            }
+I hope you're doing well. I wanted to take a moment to thank you for renewing my contract — I really appreciate the continued trust and the opportunity to keep contributing to the team.
 
-            // ⚡ 2) Load rules for all involved remapIds
-            var remapIds = claim.DistinctRemapIds;
-            var rules = await _repo.GetRulesAsync(remapIds, ct);
+I also wanted to ask a quick clarification that would help me in my discussions with Procom. Since Procom handles my payroll and they mentioned that the bill rate has been updated for the extension, would you be able to share the hourly rate that CNB is currently paying Procom under the renewed contract?
 
-            // ⚡ 3) Load full documents
-            var docs = await _repo.GetDocumentsAsync(claim.Documents, ct);
-            if (docs.Count == 0)
-            {
-                _log.LogWarning("Claimed docs but none found in DB.");
-                return false;
-            }
+I don’t want to discuss any compensation details here — this information is only to help me understand Procom’s structure so I can have a more accurate conversation with them regarding their margin.
 
-            // ⚡ 4) Convert to array and compute shard sizes
-            var docsArray = docs.ToArray();
-            int total = docsArray.Length;
-            int shardCount = Math.Min(parallelism, total);
-            if (shardCount <= 0)
-                return false;
+If you’re able to share that, it would be very helpful. Thanks again for all your support and for making this extension possible.
 
-            int shardSize = (int)Math.Ceiling(total / (double)shardCount);
+Best regards,
+[Your Name]
 
-            var shardTasks = new List<Task>(shardCount);
 
-            for (int shardIndex = 0; shardIndex < shardCount; shardIndex++)
-            {
-                int start = shardIndex * shardSize;
-                int end = Math.Min(start + shardSize, total);
-                if (start >= end)
-                    break;
+---
 
-                var segment = docsArray[start..end];
-                int localShardIndex = shardIndex; // capture safely
-
-                shardTasks.Add(Task.Run(async () =>
-                {
-                    try
-                    {
-                        var shardResults = new List<TransformedDoc>(segment.Length);
-
-                        foreach (var d in segment)
-                        {
-                            try
-                            {
-                                var rulesForRemap = rules
-                                    .Where(r => r.RemapId == d.RemapId)
-                                    .ToList();
-
-                                var result = _transformer.Transform(
-                                    d,
-                                    rulesForRemap,
-                                    d.AppendUnmapped);
-
-                                shardResults.Add(result);
-                            }
-                            catch (Exception exDoc)
-                            {
-                                _log.LogError(exDoc,
-                                    "Transform failed for doc {DocKey} (RemapId {RemapId})",
-                                    d.DocumentKey, d.RemapId);
-
-                                shardResults.Add(new TransformedDoc(
-                                    d.SiteCode,
-                                    d.RemapId,
-                                    d.DocumentKey,
-                                    d.Xml,
-                                    null,
-                                    "ERROR"));
-                            }
-                        }
-
-                        if (shardResults.Count > 0)
-                            await _repo.ApplyBatchAsync(shardResults, ct);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw; // allow cancellation
-                    }
-                    catch (Exception exShard)
-                    {
-                        _log.LogError(exShard,
-                            "Unexpected error in shard {ShardIndex}. Shard aborted.",
-                            localShardIndex);
-                    }
-
-                }, ct));
-            }
-
-            // ⚡ 5) Wait for all shards
-            await Task.WhenAll(shardTasks);
-
-            return true;
-        }
-
-        // helper you had – unchanged
-        private static List<List<ClaimedWorkItem>> MakeShards(
-            IReadOnlyList<ClaimedWorkItem> items,
-            int parallelism)
-        {
-            if (parallelism <= 1 || items.Count <= 1)
-                return new List<List<ClaimedWorkItem>> { items.ToList() };
-
-            int shardSize = Math.Max(1, (int)Math.Ceiling(items.Count / (double)parallelism));
-            var shards = new List<List<ClaimedWorkItem>>(parallelism);
-
-            for (int i = 0; i < items.Count; i += shardSize)
-            {
-                var slice = items.Skip(i).Take(shardSize).ToList();
-                if (slice.Count > 0)
-                    shards.Add(slice);
-            }
-
-            return shards;
-        }
-    }
-}
+If you want it shorter, more formal, or more casual, I can adjust it.
