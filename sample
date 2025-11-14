@@ -1,12 +1,8 @@
-{
-  "$schema": "https://json.schemastore.org/launchsettings.json",
-  "profiles": {
-    "Remap.Worker": {
-      "commandName": "Project",
-      "dotnetRunMessages": true,
-      "environmentVariables": {
-        "DOTNET_ENVIRONMENT": "Development"
-      }
-    }
-  }
-}
+LEFT JOIN dbo.tbl_IMG_DocumentCategoryRemapMigrationLog ml
+  ON ml.RemapID = er.RemapID
+ AND ml.DocumentKey = dk.DocumentKey
+ AND ml.SiteCode = er.SiteCode
+WHERE ml.RemapID IS NULL
+   OR ml.Status = 'FAILED'
+   OR (ml.Status = 'PROCESSING'
+       AND ml.ModifiedOn < DATEADD(MINUTE, -15, SYSUTCDATETIME()));
