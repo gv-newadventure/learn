@@ -1,8 +1,273 @@
-LEFT JOIN dbo.tbl_IMG_DocumentCategoryRemapMigrationLog ml
-  ON ml.RemapID = er.RemapID
- AND ml.DocumentKey = dk.DocumentKey
- AND ml.SiteCode = er.SiteCode
-WHERE ml.RemapID IS NULL
-   OR ml.Status = 'FAILED'
-   OR (ml.Status = 'PROCESSING'
-       AND ml.ModifiedOn < DATEADD(MINUTE, -15, SYSUTCDATETIME()));
+You can 100% shine in this meeting with a few focused, structured points. Here’s a way to talk about **pros and cons** and then bring up the **business rules** concern in a smart way.
+
+---
+
+## 🧩 Option 1: Add AI to the **existing ASPX invoice page**
+
+### 👍 Pros you can mention
+
+You can say:
+
+> “The main benefit of integrating into the existing invoice page is that we **reuse what already works**.”
+
+* **Users already know it** → less training, less change management.
+* **All the current business rules & validations already exist there** – so in theory we’re not reinventing everything.
+* Could be a **smaller change surface** for an MVP: UI stays same, we just add an ‘Extract from document’ button and populate fields.
+
+### 👎 Cons (this is where your ASPX point comes in)
+
+You can say:
+
+> “The risk is that this ASPX page is already quite complex and ‘notorious’ internally. Adding AI on top might **increase the spaghetti factor** instead of cleaning it up.”
+
+* **Legacy tech (ASPX)** – often tightly coupled UI + business logic + validation in the code-behind.
+* Hard to **extend UX** for AI features: previews, confidence scores, side-by-side compare, etc.
+* Every new piece of logic risks **breaking existing behaviors** because the page is so dense.
+* Makes it harder to **modernize later** – we’d be investing more into a page we might eventually want to retire.
+
+---
+
+## 🧱 Option 2: Create a **new invoice page** for AI-assisted flow
+
+### 👍 Pros
+
+You can say:
+
+> “A new page lets us design the **ideal AI-assisted invoice experience** instead of being constrained by the old UI.”
+
+* Clean, modern UX:
+
+  * upload document → show preview → show extracted fields → user confirms/edits.
+* We can **separate concerns**:
+
+  * AI extraction
+  * business rules
+  * UI
+* Easier to make the page **future-proof** (modern framework, accessibility, mobile-friendly, etc.).
+* Great opportunity to **centralize business rules** into a service/API instead of keeping them buried in ASPX.
+
+### 👎 Cons
+
+You can say:
+
+> “The trade-off is scope: a new page means **more work upfront** and we have to be very careful about consistency with the existing behavior.”
+
+* Need to **rebuild or reuse** all critical business rules and validations.
+* More testing: we must ensure the new page produces the **same results** as the old page for the same invoice.
+* Users will see a **different experience**, so there’s some change management.
+
+---
+
+## 🎯 Your killer talking point: the *business rules* question
+
+Here’s how you can phrase your concern in a constructive way:
+
+> “One big concern I have is about the **existing business rules** on the ASPX page. They’ve evolved over years, and some are probably buried in the UI layer.
+>
+> If we go with a new page, how do we want to handle that?
+>
+> * Do we want to **extract those rules into a shared service** so both the old page and the new AI page call the **same validation logic**?
+> * That way we’re not trying to manually ‘mimic’ rules; we’re reusing them and reducing the risk of inconsistent behavior.”
+
+This makes you sound:
+
+* aware of **real complexity** (not hand-wavy), and
+* solution-oriented (shared rule engine / validation service, not just “this is hard”).
+
+---
+
+## 🗣️ Short script you can literally say
+
+> “I see pros and cons both ways.
+>
+> If we plug AI into the **existing ASPX page**, we benefit from all the current rules and user familiarity, but that page is already quite complex. Adding AI on top might make it even harder to maintain.
+>
+> If we build a **new invoice page**, we can design a proper AI-assisted experience – document preview, extracted fields, confidence indicators – and we can separate AI, UI, and business rules. The challenge then is: how do we ensure we **don’t lose any of the existing business rules**?
+>
+> I’d like us to consider whether we can **extract those rules into a shared service** that both the legacy page and the new AI page can use. That way we’re not manually trying to mimic behavior, we’re reusing the same logic and reducing risk.”
+
+If you want, I can turn this into a one-pager or a few bullets you can paste into meeting notes or slides.
+
+
+
+=============================================
+Nice, you’ve thought this through really well already 👌
+
+Let me replay your flow quickly in my own words, then suggest **where to store the JSON** and give you **talking points** for the meeting.
+
+---
+
+## 🧠 Your proposed flow (summarized)
+
+1. **Upload page**
+
+   * User uploads a document (invoice, payment, insurance, etc.).
+   * You call **Document Intelligence**:
+
+     * Detect type (invoice, etc.)
+     * Extract fields → you get a **JSON** payload.
+   * You store:
+
+     * Document in **Azure Blob** (as you do today).
+     * Extracted JSON **somewhere** (short-lived).
+
+2. **Invoice Inbox queue**
+
+   * User opens the invoice entry from the queue.
+   * System checks:
+     “Is there an extracted JSON for this document?”
+   * If yes → **pre-populate invoice page** with JSON fields.
+   * User reviews, fixes, and **submits invoice**.
+   * Once invoice is created → JSON is no longer very useful (except maybe for audit/debug).
+
+That’s a solid design.
+
+---
+
+## 🎯 Design goals for JSON storage
+
+You basically need:
+
+* Fast lookup by **document ID / queue item ID**
+* Short-lived, but:
+
+  * Might still be useful for **audit**, **debugging**, or **model improvement**
+* Simple to manage / purge
+* Not getting in the way of the main transaction tables
+
+---
+
+## ✅ Option 1 – Store JSON in a separate **AI_Extraction table** (recommended)
+
+Instead of putting it directly as a column on the main invoice table, create a small **side table** like:
+
+`AI_Extraction` (or `DocumentExtraction`)
+
+* `ExtractionId` (PK)
+* `DocumentId` (or `BlobName` / `DocumentKey`)
+* `DocumentType` (Invoice/Payment/Insurance…)
+* `ExtractionJson` (NVARCHAR(MAX) / JSON type)
+* `Status` (Success, Failed, ManualOverride, etc.)
+* `CreatedAt`
+* `ExpiresAt` (optional, for cleanup jobs)
+
+**Pros:**
+
+* Clean separation: AI artifacts are **decoupled** from core invoice schema.
+* Easy lookup: join `InvoiceQueue` → `DocumentId` → `AI_Extraction`.
+* Easy lifecycle:
+
+  * Nightly job / scheduled function:
+    `DELETE FROM AI_Extraction WHERE CreatedAt < DATEADD(day, -X, GETUTCDATE()) AND IsPinned = 0`
+* You can **keep a subset** for:
+
+  * Troubleshooting “why did AI extract this?”
+  * Comparing old vs new models later.
+
+**How to present it in the meeting:**
+
+> “Instead of bloating the main invoice tables, we could have a small `AI_Extraction` table keyed by document ID.
+> The invoice page just reads JSON from there if available.
+> We can also set retention rules and purge old records after, say, 30 or 60 days.”
+
+---
+
+## 🧱 Option 2 – Store JSON as a column on the **queue / invoice staging table**
+
+If you already have a table like `InvoiceInbox` / `InvoiceQueue`, you could simply add:
+
+* `ExtractionJson`
+* `ExtractionStatus`
+* `ExtractionCreatedAt`
+
+**Pros:**
+
+* Super simple: everything about that queue item lives in one row.
+* No joins, easy reading from the inbox page → invoice page.
+
+**Cons:**
+
+* That column may grow large and sparse.
+* If the JSON is big, backups/restores and query performance might be impacted over time.
+* Harder to purge the JSON while keeping the queue row history (if required).
+
+**How to say it:**
+
+> “We could also just add an `ExtractionJson` column to the existing inbox table.
+> This is simple, but it does mean the table grows with large JSON payloads unless we have a clear purge strategy.”
+
+---
+
+## 📦 Option 3 – Store JSON as a **sidecar blob** next to the document
+
+Since your documents are already in **Azure Blob**, you could:
+
+* For each document blob:
+  `doc-12345.pdf`
+  also store `doc-12345.json` in the same container or a parallel one.
+* Your DB (queue table) just stores a **pointer/path** to the JSON blob.
+
+**Pros:**
+
+* Keeps large JSON out of the database.
+* Reuses existing storage & lifecycle policies (Blob lifecycle rules for auto-delete/archival).
+* Good if JSON is large or your DB is sensitive to growth.
+
+**Cons:**
+
+* Extra round trip: DB → blob metadata → blob read.
+* You still need some flag in DB to know:
+
+  * Extraction done?
+  * Where is the JSON blob?
+
+**How to say it:**
+
+> “Another option is to treat the JSON as a **sidecar blob** next to the document in Azure Blob Storage.
+> Our DB would just store the blob path. Then we can apply blob lifecycle rules to automatically delete these JSON blobs after a defined period.”
+
+---
+
+## ⚡ Option 4 – Purely **ephemeral cache** (Redis) – only if you *really* don’t need history
+
+If:
+
+* The time between **upload** and **user opening invoice** is always short, and
+* You truly don’t care about keeping JSON after that window,
+
+You could store the JSON in something like **Azure Cache for Redis** with a **TTL** (e.g. 7 days).
+
+**Pros:**
+
+* Very fast.
+* Auto-expiry – no cleanup job.
+
+**Cons:**
+
+* If users return later than the TTL, the JSON is gone.
+* No audit trail.
+* Not great in regulated/financial context if you’ll ever need to explain “what did AI see?”.
+
+Given your domain (invoices/finance), I’d only use this as **extra caching**, *not* as the primary storage.
+
+---
+
+## 🧭 What I’d recommend for your context
+
+For **today’s discussion**, I’d lean towards this:
+
+> “My suggestion would be to store the extracted JSON either in a dedicated `AI_Extraction` table, keyed by the document ID, or as a sidecar JSON blob with a pointer in the DB.
+> Both approaches let the invoice page easily pre-populate fields, but also give us:
+>
+> * clear retention & purge strategy,
+> * room for future audit/debug needs, and
+> * less coupling with the core invoice transaction schema.”
+
+If you want, I can turn your whole explanation + this design into a **clean markdown/Notion-style summary** that you can paste into Confluence or send to the team.
+
+---
+
+🔡 **By the way:** your message has a few small typos (e.g., “Alos”, “let us introduce”, “let grab”).
+Do you want me to rewrite your whole explanation in polished English so you can paste it into an email or slide?
+
+
