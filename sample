@@ -1,1 +1,324 @@
+Yeah, inserting 1M rows one-by-one with a fresh SqlConnection+SqlCommand each time will be sloooow. We can speed this up a lot without getting crazy by:
 
+1. Reusing a single connection and prepared command per worker
+
+
+2. Running multiple workers in parallel, each handling a slice of the range
+
+
+3. Avoiding the @DocumentKey already declared issue by letting SQL generate it (no param + no duplicate DECLARE)
+
+
+
+Below is a drop-in upgrade of the loader that should be orders of magnitude faster.
+
+
+---
+
+1️⃣ Updated Program.cs – parallel workers
+
+We’ll run N workers (configurable) in parallel, each inserting a range of documents.
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+
+namespace CategoryRemap.DataLoad
+{
+    internal class Program
+    {
+        static async Task Main(string[] args)
+        {
+            var config = new ConfigurationBuilder()
+                .AddJsonFile("appsettings.json", optional: false)
+                .AddEnvironmentVariables()
+                .Build();
+
+            var connString = config.GetConnectionString("RemapDb")
+                             ?? throw new InvalidOperationException("Missing connection string 'RemapDb'.");
+
+            int totalRecords = config.GetSection("TestData").GetValue<int>("TotalRecords", 1_000_000);
+            string siteCode  = config.GetSection("TestData").GetValue<string>("SiteCode", "R2");
+            int workers      = config.GetSection("TestData").GetValue<int>("Workers", Environment.ProcessorCount);
+
+            Console.WriteLine($"Connection : {connString}");
+            Console.WriteLine($"Total rows : {totalRecords}");
+            Console.WriteLine($"SiteCode   : {siteCode}");
+            Console.WriteLine($"Workers    : {workers}");
+            Console.WriteLine();
+
+            var loader = new TestDataLoader(connString, siteCode);
+
+            var cts = new CancellationTokenSource();
+            var tasks = new Task[workers];
+
+            int baseChunk = totalRecords / workers;
+            int remainder = totalRecords % workers;
+
+            int current = 0;
+            for (int w = 0; w < workers; w++)
+            {
+                int chunk = baseChunk + (w < remainder ? 1 : 0);
+                int startIndex = current;
+                current += chunk;
+
+                if (chunk == 0)
+                {
+                    tasks[w] = Task.CompletedTask;
+                    continue;
+                }
+
+                tasks[w] = loader.InsertRangeAsync(startIndex, chunk, w, cts.Token);
+            }
+
+            var start = DateTime.UtcNow;
+            await Task.WhenAll(tasks);
+            var elapsed = DateTime.UtcNow - start;
+
+            Console.WriteLine($"DONE. Inserted {totalRecords} rows in {elapsed.TotalSeconds:F1} seconds.");
+        }
+    }
+}
+
+
+---
+
+2️⃣ Faster loader: single connection + prepared command per worker
+
+Key things:
+
+Each worker opens one SqlConnection.
+
+We build the SqlCommand once, add parameters once, then just change .Value in the loop.
+
+SQL script uses NEWID() inside SQL for @DocumentKey so you no longer get the “already declared” error.
+
+
+using System;
+using System.Data;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Data.SqlClient;
+
+namespace CategoryRemap.DataLoad
+{
+    internal sealed class TestDataLoader
+    {
+        private readonly string _connectionString;
+        private readonly string _siteCode;
+        private readonly Random _random = new();
+
+        // constants from your screenshots
+        private static readonly Guid DocClientKey   = Guid.Parse("31C18D6A-0ABE-4FAF-A9AC-3472F05515BF");
+        private static readonly Guid CategoryKey    = Guid.Parse("1CDB0953-4D94-4687-98E0-45750D1D51F2");
+        private static readonly Guid ChangeUserKey  = Guid.Parse("C59A0230-F96E-4B92-9746-A098F313C3A5");
+        private static readonly Guid UploadUserKey  = Guid.Parse("5EC6F8E8-A587-4AC3-9C72-FDE52EDBBFBE");
+        private static readonly Guid DocStoreFileId = Guid.Parse("7D5B0942-F506-4540-B568-5EE864E6DDF9");
+
+        public TestDataLoader(string connectionString, string siteCode)
+        {
+            _connectionString = connectionString;
+            _siteCode = siteCode;
+        }
+
+        /// <summary>
+        /// Insert [count] documents, starting at [startIndex], using a single connection & command.
+        /// </summary>
+        public async Task InsertRangeAsync(int startIndex, int count, int workerId, CancellationToken ct)
+        {
+            using var conn = new SqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
+
+            using var cmd = conn.CreateCommand();
+            cmd.CommandType = CommandType.Text;
+
+            // IMPORTANT: @DocumentKey is generated inside SQL ONLY once.
+            cmd.CommandText = @"
+DECLARE @Now datetime = GETDATE();
+DECLARE @DocumentID bigint;
+DECLARE @DocDetID bigint;
+DECLARE @DocumentKey uniqueidentifier = NEWID();
+
+-- 1) tbl_IMG_Documents
+INSERT INTO dbo.tbl_IMG_Documents
+(
+    DocType,
+    UploadDate,
+    UploadUserKey,
+    UploadSource,
+    DocStoreFileID,
+    DocumentContents,
+    HasScriptsRemoved
+)
+VALUES
+(
+    @DocType,
+    @UploadDate,
+    @UploadUserKey,
+    @UploadSource,
+    @DocStoreFileID,
+    NULL,
+    NULL
+);
+
+SET @DocumentID = SCOPE_IDENTITY();
+
+-- 2) tbl_IMG_DocumentDetails
+INSERT INTO dbo.tbl_IMG_DocumentDetails (DocumentID)
+VALUES (@DocumentID);
+
+SET @DocDetID = SCOPE_IDENTITY();
+
+-- 3) tbl_IMG_DocumentKeys
+INSERT INTO dbo.tbl_IMG_DocumentKeys
+(
+    DocumentKey,
+    SiteCode,
+    DocClientKey,
+    Deleted,
+    DocStatus,
+    CategoryKey,
+    SubcategoryID,
+    DocDesc,
+    DocPriority,
+    DocPriorityComment,
+    ChangeUserKey,
+    ChangeDate,
+    ChangeProcedure,
+    DocDetID
+)
+VALUES
+(
+    @DocumentKey,
+    @SiteCode,
+    @DocClientKey,
+    0,
+    1,
+    @CategoryKey,
+    NULL,
+    @DocDesc,
+    0,
+    NULL,
+    @ChangeUserKey,
+    @Now,
+    @ChangeProcedure,
+    @DocDetID
+);
+
+-- 4) tbl_IMG_DocumentData
+INSERT INTO dbo.tbl_IMG_DocumentData
+(
+    DocumentKey,
+    FieldData
+)
+VALUES
+(
+    @DocumentKey,
+    @FieldData
+);";
+
+            // define parameters ONCE
+            cmd.Parameters.Add("@DocType", SqlDbType.VarChar, 50);
+            cmd.Parameters.Add("@UploadDate", SqlDbType.DateTime);
+            cmd.Parameters.Add("@UploadUserKey", SqlDbType.UniqueIdentifier);
+            cmd.Parameters.Add("@UploadSource", SqlDbType.VarChar, 50);
+            cmd.Parameters.Add("@DocStoreFileID", SqlDbType.UniqueIdentifier);
+
+            cmd.Parameters.Add("@SiteCode", SqlDbType.VarChar, 2);
+            cmd.Parameters.Add("@DocClientKey", SqlDbType.UniqueIdentifier);
+            cmd.Parameters.Add("@CategoryKey", SqlDbType.UniqueIdentifier);
+            cmd.Parameters.Add("@ChangeUserKey", SqlDbType.UniqueIdentifier);
+            cmd.Parameters.Add("@ChangeProcedure", SqlDbType.VarChar, 128);
+            cmd.Parameters.Add("@DocDesc", SqlDbType.VarChar, 500);
+            cmd.Parameters.Add("@FieldData", SqlDbType.Xml);
+
+            // fixed values
+            cmd.Parameters["@DocType"].Value        = "PDF";
+            cmd.Parameters["@UploadUserKey"].Value  = UploadUserKey;
+            cmd.Parameters["@UploadSource"].Value   = "DOCUPLOAD";
+            cmd.Parameters["@DocStoreFileID"].Value = DocStoreFileId;
+            cmd.Parameters["@SiteCode"].Value       = _siteCode;
+            cmd.Parameters["@DocClientKey"].Value   = DocClientKey;
+            cmd.Parameters["@CategoryKey"].Value    = CategoryKey;
+            cmd.Parameters["@ChangeUserKey"].Value  = ChangeUserKey;
+            cmd.Parameters["@ChangeProcedure"].Value= "Test Data Load";
+
+            for (int i = 0; i < count; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                int globalIndex = startIndex + i;
+
+                cmd.Parameters["@UploadDate"].Value = DateTime.Now;
+                cmd.Parameters["@DocDesc"].Value    = $"Test Document #{globalIndex:000000}";
+                cmd.Parameters["@FieldData"].Value  = BuildFieldDataXml(globalIndex);
+
+                await cmd.ExecuteNonQueryAsync(ct);
+
+                if (globalIndex % 10_000 == 0)
+                {
+                    Console.WriteLine($"[Worker {workerId}] Inserted up to #{globalIndex}");
+                }
+            }
+        }
+
+        private string BuildFieldDataXml(int index)
+        {
+            // Every 10th row: <FieldData /> to test that path
+            if (index % 10 == 0)
+            {
+                return "<FieldData />";
+            }
+
+            var title = (index % 2 == 0) ? "Mr" : "Ms";
+            var firstName = $"First{index:000000}";
+            var middleName = "M";
+            var lastName = $"Last{index:000000}";
+            var emailPromotion = (index % 3 == 0) ? "Y" : "N";
+            var dob = new DateTime(1980, 1, 1).AddDays(index % 10_000);
+            var age = (int)((DateTime.Today - dob).TotalDays / 365.25);
+            var balance = Math.Round(_random.NextDouble() * 10_000, 2);
+
+            var sb = new StringBuilder();
+            sb.AppendLine("<FieldData>");
+            sb.AppendLine($"  <Title>{title}</Title>");
+            sb.AppendLine($"  <FirstName>{firstName}</FirstName>");
+            sb.AppendLine($"  <MiddleName>{middleName}</MiddleName>");
+            sb.AppendLine($"  <LastName>{lastName}</LastName>");
+            sb.AppendLine($"  <EmailPromotion>{emailPromotion}</EmailPromotion>");
+            sb.AppendLine($"  <DateOfBirth>{dob:yyyy-MM-dd}</DateOfBirth>");
+            sb.AppendLine($"  <PersonAge>{age}</PersonAge>");
+            sb.AppendLine($"  <Balance>{balance}</Balance>");
+            sb.AppendLine("</FieldData>");
+
+            return sb.ToString();
+        }
+    }
+}
+
+
+---
+
+Why this will be much faster
+
+No per-row connection open/close – each worker keeps its connection open.
+
+No per-row parameter creation – we reuse parameters and just update values.
+
+Parallelism – multiple workers insert concurrently (tune TestData:Workers).
+
+No duplicate @DocumentKey – we generate it once per document inside SQL (DECLARE @DocumentKey = NEWID()), so the “already been declared” error goes away.
+
+
+If this still isn’t fast enough and you want to push it even harder, the next step would be a hybrid:
+
+Generate in-memory batches (e.g., 10k rows) for each table as DataTables
+
+Use SqlBulkCopy per table with IDENTITY_INSERT ON and precomputed keys
+
+
+…but the parallel, prepared-command approach above is usually plenty for a 1M-row test harness.
+
+If you paste your current loader code and numbers (how long for how many rows), I can help you tune Workers, logging, and maybe add small batch transactions for a sweet spot between speed and log growth.
